@@ -56,6 +56,7 @@ COPILOT_SCOPES = ["read:user", "user:email", "copilot"]
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "claude-sonnet-4.5")
 DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
+DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT", "high")
 CONTEXT_FILENAME = "AGENTS.md"
 BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
@@ -73,8 +74,11 @@ class ChatUI:
         self._assistant_text = Text()
         self._reasoning_text = Text(style="dim italic")
 
-    def startup(self, provider: str, model: str) -> None:
-        self.console.print(Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{provider} / {model}[/dim]"))
+    def startup(self, provider: str, model: str, reasoning_effort: str | None) -> None:
+        subtitle = f"{provider} / {model}"
+        if reasoning_effort:
+            subtitle += f" / reasoning={reasoning_effort}"
+        self.console.print(Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{subtitle}[/dim]"))
         self.console.print("[dim]Type /exit to quit.[/dim]")
 
     def prompt(self) -> str:
@@ -1169,15 +1173,30 @@ def add_line_numbers(text: str, max_lines: int = 400, max_chars: int = 30000) ->
 
 
 class NanoAgent:
-    def __init__(self, model: str, cwd: Path, provider: str, api_key: str | None = None, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        cwd: Path,
+        provider: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> None:
         self.model = model
         self.cwd = cwd.resolve()
         self.provider = provider
+        self.reasoning_effort = None if reasoning_effort in {None, "none"} else reasoning_effort
         self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
         self.messages: list[dict[str, Any]] = []
         self.bash = PersistentBashSession()
         self.active_skills: set[str] = set()
         self.ui = ChatUI()
+
+    def completion_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        return kwargs
 
     def close(self) -> None:
         self.bash.close()
@@ -1235,6 +1254,7 @@ class NanoAgent:
                     "content": f"Request: {prompt}\n\nWeb content:\n\n{limited}",
                 },
             ],
+            **self.completion_kwargs(),
         )
         return response.choices[0].message.content or ""
 
@@ -1341,6 +1361,7 @@ The skill directory is located at: {skill.directory}
                 tools=self.tool_specs(),
                 tool_choice="auto",
                 stream=True,
+                **self.completion_kwargs(),
             )
 
             async for chunk in stream:
@@ -1407,6 +1428,7 @@ async def run_chat(
     provider: str,
     api_key: str | None = None,
     base_url: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> None:
     agent = NanoAgent(
         model=model,
@@ -1414,13 +1436,14 @@ async def run_chat(
         provider=provider,
         api_key=api_key,
         base_url=base_url,
+        reasoning_effort=reasoning_effort,
     )
     try:
         if prompt is not None:
             await agent.send(prompt)
             return
 
-        agent.ui.startup(provider, model)
+        agent.ui.startup(provider, model, reasoning_effort)
         while True:
             try:
                 user_input = agent.ui.prompt()
@@ -1447,6 +1470,13 @@ async def run_chat(
 @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Model to use")
 @click.option("--api-key", help="API key for direct OpenAI-compatible endpoint mode")
 @click.option("--base-url", help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--reasoning-effort",
+    type=click.Choice(["none", "minimal", "low", "medium", "high"], case_sensitive=False),
+    default=DEFAULT_REASONING_EFFORT,
+    show_default=True,
+    help="Reasoning effort for supported models",
+)
 @click.argument("prompt", required=False)
 @click.pass_context
 def main(
@@ -1455,6 +1485,7 @@ def main(
     model: str,
     api_key: str | None,
     base_url: str | None,
+    reasoning_effort: str,
     prompt: str | None,
 ) -> None:
     """Nano agent using chat completions via Copilot or OpenAI."""
@@ -1469,6 +1500,7 @@ def main(
                 provider=provider,
                 api_key=api_key,
                 base_url=base_url,
+                reasoning_effort=reasoning_effort,
             )
         )
     except CopilotAuthError as exc:
