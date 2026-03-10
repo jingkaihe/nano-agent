@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#   "click>=8.1.8",
 #   "openai>=1.68.2",
 #   "httpx>=0.28.1",
 #   "requests>=2.32.3",
@@ -12,7 +13,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import difflib
 import json
@@ -34,6 +34,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 import requests
 import yaml
+import click
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
@@ -46,6 +47,7 @@ COPILOT_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 COPILOT_SCOPES = ["read:user", "user:email", "copilot"]
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "claude-sonnet-4.5")
+DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
 CONTEXT_FILENAME = "AGENTS.md"
 BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
@@ -138,6 +140,28 @@ def create_openai_copilot_client() -> AsyncOpenAI:
             "Editor-Version": "vscode/1.102.0",
         },
     )
+
+
+def create_direct_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpenAI:
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return AsyncOpenAI(**kwargs)
+
+
+def create_client(provider: str, api_key: str | None = None, base_url: str | None = None) -> AsyncOpenAI:
+    normalized = provider.strip().lower()
+    if normalized == "copilot":
+        return create_openai_copilot_client()
+    if normalized == "openai":
+        resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
+        if not resolved_api_key:
+            raise ValueError(
+                "OpenAI API key not found. Set OPENAI_API_KEY or pass --api-key."
+            )
+        resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
+        return create_direct_openai_client(resolved_api_key, resolved_base_url)
+    raise ValueError(f"unsupported provider: {provider}")
 
 
 def generate_device_flow() -> dict[str, Any]:
@@ -637,6 +661,78 @@ def web_fetch_schema() -> dict[str, Any]:
     }
 
 
+def _to_plain_data(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        return [_to_plain_data(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(exclude_none=True)
+    return value
+
+
+def _extract_text_fragments(value: Any) -> list[str]:
+    plain = _to_plain_data(value)
+    if plain is None:
+        return []
+    if isinstance(plain, str):
+        return [plain]
+    if isinstance(plain, list):
+        fragments: list[str] = []
+        for item in plain:
+            fragments.extend(_extract_text_fragments(item))
+        return fragments
+    if isinstance(plain, dict):
+        fragments: list[str] = []
+        for key in ("text", "content", "value"):
+            if isinstance(plain.get(key), str):
+                fragments.append(plain[key])
+        return fragments
+    return []
+
+
+def _get_delta_fragments(delta: Any, keys: list[str]) -> list[str]:
+    plain = _to_plain_data(delta)
+    if not isinstance(plain, dict):
+        return []
+    fragments: list[str] = []
+    for key in keys:
+        fragments.extend(_extract_text_fragments(plain.get(key)))
+    return fragments
+
+
+def _merge_stream_tool_call(accumulator: dict[int, dict[str, Any]], tool_call: Any) -> None:
+    plain = _to_plain_data(tool_call)
+    if not isinstance(plain, dict):
+        return
+    index = plain.get("index", 0)
+    current = accumulator.setdefault(
+        int(index),
+        {
+            "id": plain.get("id"),
+            "type": plain.get("type", "function"),
+            "function": {"name": "", "arguments": ""},
+        },
+    )
+    if plain.get("id"):
+        current["id"] = plain["id"]
+    if plain.get("type"):
+        current["type"] = plain["type"]
+    function = plain.get("function") or {}
+    if isinstance(function, dict):
+        if function.get("name"):
+            current["function"]["name"] += function["name"]
+        if function.get("arguments"):
+            current["function"]["arguments"] += function["arguments"]
+
+
+def _ordered_tool_calls(accumulator: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    return [accumulator[index] for index in sorted(accumulator)]
+
+
 class PersistentBashSession:
     def __init__(self) -> None:
         self.proc: subprocess.Popen[bytes] | None = None
@@ -1004,10 +1100,11 @@ def add_line_numbers(text: str, max_lines: int = 400, max_chars: int = 30000) ->
 
 
 class NanoAgent:
-    def __init__(self, model: str, cwd: Path) -> None:
+    def __init__(self, model: str, cwd: Path, provider: str, api_key: str | None = None, base_url: str | None = None) -> None:
         self.model = model
         self.cwd = cwd.resolve()
-        self.client = create_openai_copilot_client()
+        self.provider = provider
+        self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
         self.messages: list[dict[str, Any]] = []
         self.bash = PersistentBashSession()
         self.active_skills: set[str] = set()
@@ -1161,7 +1258,12 @@ The skill directory is located at: {skill.directory}
     async def send(self, user_input: str) -> None:
         self.messages.append({"role": "user", "content": user_input})
         while True:
-            response = await self.client.chat.completions.create(
+            assistant_content_parts: list[str] = []
+            tool_call_parts: dict[int, dict[str, Any]] = {}
+            reasoning_started = False
+            text_started = False
+
+            stream = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": build_system_prompt(self.cwd)},
@@ -1169,61 +1271,102 @@ The skill directory is located at: {skill.directory}
                 ],
                 tools=self.tool_specs(),
                 tool_choice="auto",
+                stream=True,
             )
 
-            message = response.choices[0].message
+            async for chunk in stream:
+                choice = chunk.choices[0] if getattr(chunk, "choices", None) else None
+                if choice is None:
+                    continue
+
+                delta = _to_plain_data(choice.delta) or {}
+
+                for fragment in _get_delta_fragments(delta, ["reasoning", "thinking"]):
+                    if fragment:
+                        if text_started:
+                            print()
+                            text_started = False
+                        if not reasoning_started:
+                            print("💭 ", end="", flush=True)
+                            reasoning_started = True
+                        print(fragment, end="", flush=True)
+
+                content = delta.get("content")
+                if isinstance(content, str):
+                    if reasoning_started:
+                        print()
+                        reasoning_started = False
+                    print(content, end="", flush=True)
+                    text_started = True
+                    assistant_content_parts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        item_plain = _to_plain_data(item)
+                        if isinstance(item_plain, dict):
+                            for fragment in _extract_text_fragments(item_plain):
+                                if reasoning_started:
+                                    print()
+                                    reasoning_started = False
+                                print(fragment, end="", flush=True)
+                                text_started = True
+                                assistant_content_parts.append(fragment)
+
+                for streamed_tool_call in delta.get("tool_calls") or []:
+                    _merge_stream_tool_call(tool_call_parts, streamed_tool_call)
+
+            if reasoning_started or text_started:
+                print()
+
+            message_tool_calls = _ordered_tool_calls(tool_call_parts)
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
-                "content": message.content,
+                "content": "".join(assistant_content_parts) or None,
             }
-            tool_calls = []
-            if message.tool_calls:
-                for call in message.tool_calls:
-                    tool_calls.append(
-                        {
-                            "id": call.id,
-                            "type": call.type,
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments,
-                            },
-                        }
-                    )
-                assistant_message["tool_calls"] = tool_calls
+            if message_tool_calls:
+                assistant_message["tool_calls"] = message_tool_calls
 
             self.messages.append(assistant_message)
 
-            if message.content:
-                print(message.content)
-
-            if not message.tool_calls:
+            if not message_tool_calls:
                 return
 
-            for call in message.tool_calls:
+            for call in message_tool_calls:
                 try:
-                    args = json.loads(call.function.arguments or "{}")
+                    args = json.loads(call["function"].get("arguments") or "{}")
                 except json.JSONDecodeError as exc:
                     result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
                 else:
-                    result = await self.run_tool(call.function.name, args)
-                print(f"[tool:{call.function.name}] {json.dumps(result, ensure_ascii=False)}")
+                    result = await self.run_tool(call["function"]["name"], args)
+                print(f"[tool:{call['function']['name']}] {json.dumps(result, ensure_ascii=False)}")
                 self.messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": call.id,
+                        "tool_call_id": call["id"],
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
 
 
-async def run_chat(model: str, prompt: str | None) -> None:
-    agent = NanoAgent(model=model, cwd=Path.cwd())
+async def run_chat(
+    model: str,
+    prompt: str | None,
+    provider: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> None:
+    agent = NanoAgent(
+        model=model,
+        cwd=Path.cwd(),
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+    )
     try:
         if prompt is not None:
             await agent.send(prompt)
             return
 
-        print(f"Using {model}")
+        print(f"Using {provider} / {model}")
         print("Type /exit to quit.")
         while True:
             try:
@@ -1240,40 +1383,59 @@ async def run_chat(model: str, prompt: str | None) -> None:
         agent.close()
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Nano agent using GitHub Copilot chat completions")
-    subparsers = parser.add_subparsers(dest="command")
-
-    login_parser = subparsers.add_parser("login", help="Authenticate with GitHub Copilot")
-    login_parser.add_argument("--output", type=Path, help="Credentials output path")
-
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model to use")
-    parser.add_argument("prompt", nargs="?", help="Optional one-shot prompt")
-    return parser
-
-
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.command == "login":
-        try:
-            copilot_login(args.output)
-        except KeyboardInterrupt:
-            print("\nAuthentication cancelled", file=sys.stderr)
-            raise SystemExit(1)
-        except Exception as exc:
-            print(f"Authentication failed: {exc}", file=sys.stderr)
-            raise SystemExit(1)
+@click.group(invoke_without_command=True)
+@click.option(
+    "--provider",
+    type=click.Choice(["copilot", "openai"], case_sensitive=False),
+    default=DEFAULT_PROVIDER,
+    show_default=True,
+    help="LLM provider to use",
+)
+@click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Model to use")
+@click.option("--api-key", help="API key for direct OpenAI-compatible endpoint mode")
+@click.option("--base-url", help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.argument("prompt", required=False)
+@click.pass_context
+def main(
+    ctx: click.Context,
+    provider: str,
+    model: str,
+    api_key: str | None,
+    base_url: str | None,
+    prompt: str | None,
+) -> None:
+    """Nano agent using chat completions via Copilot or OpenAI."""
+    if ctx.invoked_subcommand is not None:
         return
 
     try:
-        asyncio.run(run_chat(args.model, args.prompt))
+        asyncio.run(
+            run_chat(
+                model=model,
+                prompt=prompt,
+                provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+            )
+        )
     except CopilotAuthError as exc:
-        print(str(exc), file=sys.stderr)
-        raise SystemExit(1)
+        raise click.ClickException(str(exc)) from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     except KeyboardInterrupt:
-        print()
+        click.echo()
+
+
+@main.command()
+@click.option("--output", type=click.Path(path_type=Path), help="Credentials output path")
+def login(output: Path | None) -> None:
+    """Authenticate with GitHub Copilot."""
+    try:
+        copilot_login(output)
+    except KeyboardInterrupt:
+        raise click.ClickException("Authentication cancelled")
+    except Exception as exc:
+        raise click.ClickException(f"Authentication failed: {exc}") from exc
 
 
 if __name__ == "__main__":
