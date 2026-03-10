@@ -22,14 +22,12 @@ import platform
 import re
 import select
 import shlex
-import shutil
 import subprocess
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -90,8 +88,9 @@ class ChatUI:
         group = Group(
             Panel(self._assistant_text or Text("…", style="dim"), title="Assistant", border_style="blue"),
         )
-        self._assistant_live = Live(group, console=self.console, refresh_per_second=12)
-        self._assistant_live.start()
+        live = Live(group, console=self.console, refresh_per_second=12)
+        self._assistant_live = live
+        live.start()
 
     def update_assistant(self, text_fragment: str = "", reasoning_fragment: str = "") -> None:
         if text_fragment:
@@ -1511,7 +1510,7 @@ def main(
         click.echo()
 
 
-@main.command()
+@cast(Any, main).command()
 @click.option("--output", type=click.Path(path_type=Path), help="Credentials output path")
 def login(output: Path | None) -> None:
     """Authenticate with GitHub Copilot."""
@@ -1524,4 +1523,4 @@ def login(output: Path | None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cast(Any, main)()
