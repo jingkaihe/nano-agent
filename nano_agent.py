@@ -8,6 +8,7 @@
 #   "PyYAML>=6.0.2",
 #   "markdownify>=0.13.1",
 #   "Jinja2>=3.1.4",
+#   "rich>=13.9.4",
 # ]
 # ///
 
@@ -38,6 +39,13 @@ import click
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
+from rich.console import Console, Group
+from rich.json import JSON as RichJSON
+from rich.live import Live
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.rule import Rule
+from rich.text import Text
 
 
 COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
@@ -56,6 +64,67 @@ JINJA = Environment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=T
 
 class CopilotAuthError(Exception):
     pass
+
+
+class ChatUI:
+    def __init__(self) -> None:
+        self.console = Console()
+        self._assistant_live: Live | None = None
+        self._assistant_text = Text()
+        self._reasoning_text = Text(style="dim italic")
+
+    def startup(self, provider: str, model: str) -> None:
+        self.console.print(Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{provider} / {model}[/dim]"))
+        self.console.print("[dim]Type /exit to quit.[/dim]")
+
+    def prompt(self) -> str:
+        return Prompt.ask("[bold green]You[/bold green]").strip()
+
+    def begin_assistant(self) -> None:
+        self._assistant_text = Text()
+        self._reasoning_text = Text(style="dim italic")
+        group = Group(
+            Panel(self._assistant_text or Text("…", style="dim"), title="Assistant", border_style="blue"),
+        )
+        self._assistant_live = Live(group, console=self.console, refresh_per_second=12)
+        self._assistant_live.start()
+
+    def update_assistant(self, text_fragment: str = "", reasoning_fragment: str = "") -> None:
+        if text_fragment:
+            self._assistant_text.append(text_fragment)
+        if reasoning_fragment:
+            self._reasoning_text.append(reasoning_fragment)
+        if not self._assistant_live:
+            return
+        renderables: list[Any] = []
+        if self._reasoning_text.plain:
+            renderables.append(Panel(self._reasoning_text, title="Thinking", border_style="magenta"))
+        renderables.append(
+            Panel(
+                self._assistant_text if self._assistant_text.plain else Text("…", style="dim"),
+                title="Assistant",
+                border_style="blue",
+            )
+        )
+        self._assistant_live.update(Group(*renderables))
+
+    def end_assistant(self) -> None:
+        if self._assistant_live:
+            self._assistant_live.stop()
+            self._assistant_live = None
+
+    def show_tool_result(self, name: str, result: dict[str, Any]) -> None:
+        border = "green" if result.get("success") else "red"
+        self.console.print(
+            Panel(
+                RichJSON.from_data(result),
+                title=f"tool: {name}",
+                border_style=border,
+            )
+        )
+
+    def newline(self) -> None:
+        self.console.print()
 
 
 def credentials_path() -> Path:
@@ -1108,6 +1177,7 @@ class NanoAgent:
         self.messages: list[dict[str, Any]] = []
         self.bash = PersistentBashSession()
         self.active_skills: set[str] = set()
+        self.ui = ChatUI()
 
     def close(self) -> None:
         self.bash.close()
@@ -1260,8 +1330,7 @@ The skill directory is located at: {skill.directory}
         while True:
             assistant_content_parts: list[str] = []
             tool_call_parts: dict[int, dict[str, Any]] = {}
-            reasoning_started = False
-            text_started = False
+            self.ui.begin_assistant()
 
             stream = await self.client.chat.completions.create(
                 model=self.model,
@@ -1283,39 +1352,24 @@ The skill directory is located at: {skill.directory}
 
                 for fragment in _get_delta_fragments(delta, ["reasoning", "thinking"]):
                     if fragment:
-                        if text_started:
-                            print()
-                            text_started = False
-                        if not reasoning_started:
-                            print("💭 ", end="", flush=True)
-                            reasoning_started = True
-                        print(fragment, end="", flush=True)
+                        self.ui.update_assistant(reasoning_fragment=fragment)
 
                 content = delta.get("content")
                 if isinstance(content, str):
-                    if reasoning_started:
-                        print()
-                        reasoning_started = False
-                    print(content, end="", flush=True)
-                    text_started = True
+                    self.ui.update_assistant(text_fragment=content)
                     assistant_content_parts.append(content)
                 elif isinstance(content, list):
                     for item in content:
                         item_plain = _to_plain_data(item)
                         if isinstance(item_plain, dict):
                             for fragment in _extract_text_fragments(item_plain):
-                                if reasoning_started:
-                                    print()
-                                    reasoning_started = False
-                                print(fragment, end="", flush=True)
-                                text_started = True
+                                self.ui.update_assistant(text_fragment=fragment)
                                 assistant_content_parts.append(fragment)
 
                 for streamed_tool_call in delta.get("tool_calls") or []:
                     _merge_stream_tool_call(tool_call_parts, streamed_tool_call)
 
-            if reasoning_started or text_started:
-                print()
+            self.ui.end_assistant()
 
             message_tool_calls = _ordered_tool_calls(tool_call_parts)
             assistant_message: dict[str, Any] = {
@@ -1337,7 +1391,7 @@ The skill directory is located at: {skill.directory}
                     result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
                 else:
                     result = await self.run_tool(call["function"]["name"], args)
-                print(f"[tool:{call['function']['name']}] {json.dumps(result, ensure_ascii=False)}")
+                self.ui.show_tool_result(call["function"]["name"], result)
                 self.messages.append(
                     {
                         "role": "tool",
@@ -1366,13 +1420,12 @@ async def run_chat(
             await agent.send(prompt)
             return
 
-        print(f"Using {provider} / {model}")
-        print("Type /exit to quit.")
+        agent.ui.startup(provider, model)
         while True:
             try:
-                user_input = input("> ").strip()
+                user_input = agent.ui.prompt()
             except EOFError:
-                print()
+                agent.ui.newline()
                 break
             if not user_input:
                 continue
