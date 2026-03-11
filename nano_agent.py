@@ -37,6 +37,7 @@ import click
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.rule import Rule
@@ -1445,14 +1446,16 @@ class NanoAgent:
             assistant_content_parts: list[str] = []
             tool_call_parts: dict[int, dict[str, Any]] = {}
             self.ui.begin_assistant()
+            chat_messages = cast(
+                list[ChatCompletionMessageParam],
+                [{"role": "system", "content": build_system_prompt(self.cwd)}, *self.messages],
+            )
+            chat_tools = cast(list[ChatCompletionToolParam], self.tool_specs())
 
             stream = await self.client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": build_system_prompt(self.cwd)},
-                    *self.messages,
-                ],
-                tools=self.tool_specs(),
+                messages=chat_messages,
+                tools=chat_tools,
                 tool_choice="auto",
                 stream=True,
                 **self.completion_kwargs(),
