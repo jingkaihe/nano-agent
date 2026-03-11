@@ -25,7 +25,9 @@ import re
 import shlex
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin, urlparse
@@ -34,6 +36,7 @@ import httpx
 import requests
 import yaml
 import click
+from click.core import ParameterSource
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
@@ -44,6 +47,7 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.rule import Rule
+from rich.table import Table
 
 
 COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
@@ -58,6 +62,7 @@ DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT", "high")
 CONTEXT_FILENAME = "AGENTS.md"
 BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
+HISTORY_DIR = Path.home() / ".nano-agent" / "history"
 JINJA = Environment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
 
 
@@ -97,11 +102,20 @@ class ChatUI:
         self.console.print()
         self.console.print(Rule(f"[{style}]{label}[/{style}]", style=style))
 
-    def startup(self, provider: str, model: str, reasoning_effort: str | None) -> None:
+    def startup(
+        self,
+        provider: str,
+        model: str,
+        reasoning_effort: str | None,
+        session_id: str,
+        resumed: bool = False,
+    ) -> None:
         subtitle = f"{provider} / {model}"
         if reasoning_effort:
             subtitle += f" / reasoning={reasoning_effort}"
         self.console.print(Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{subtitle}[/dim]"))
+        prefix = "Resumed session" if resumed else "Session"
+        self.console.print(f"[dim]{prefix}: {session_id}[/dim]")
         self.console.print("[dim]Type /exit to quit.[/dim]")
         self.console.print("[dim]Press Enter to submit. Press Ctrl+X Ctrl+E to edit in $EDITOR. Ctrl+D exits on empty input.[/dim]")
 
@@ -156,12 +170,143 @@ class ChatUI:
     def newline(self) -> None:
         self.console.print()
 
+    def show_session_exit(self, session_id: str) -> None:
+        self.console.print(Rule(style="dim"))
+        self.console.print(f"[dim]Session saved: {session_id}[/dim]")
+
 
 def credentials_path() -> Path:
     raw = os.getenv("NANO_AGENT_COPILOT_CREDS")
     if raw:
         return Path(raw).expanduser()
     return Path.home() / ".nano-agent" / "copilot.json"
+
+
+def normalize_session_id(value: str) -> str:
+    session_id = value.strip()
+    if session_id.endswith(".json"):
+        session_id = session_id[:-5]
+    if not session_id:
+        raise ValueError("resume id is required")
+    if "/" in session_id or "\\" in session_id:
+        raise ValueError("resume id must be a session uuid, not a path")
+    return session_id
+
+
+def conversation_history_path(session_id: str) -> Path:
+    return HISTORY_DIR / f"{normalize_session_id(session_id)}.json"
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def first_user_prompt(messages: list[dict[str, Any]]) -> str:
+    for message in messages:
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""
+
+
+def summarize_prompt(text: str, max_words: int = 10) -> str:
+    words = text.split()
+    if not words:
+        return ""
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]) + " …"
+
+
+def load_conversation_history(session_id: str) -> dict[str, Any]:
+    normalized = normalize_session_id(session_id)
+    path = conversation_history_path(normalized)
+    if not path.exists():
+        raise ValueError(f"history session not found: {normalized}")
+
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"history session is invalid: {normalized}")
+
+    model = data.get("model")
+    provider = data.get("provider")
+    reasoning_effort = data.get("reasoning_effort")
+    history = data.get("history") if isinstance(data.get("history"), dict) else {}
+    messages = history.get("messages", data.get("messages", []))
+    responses_items = history.get("responses_items", data.get("responses_items", []))
+    stored_id = data.get("id")
+    created_at = data.get("created_at")
+    updated_at = data.get("updated_at")
+
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"history session is missing model: {normalized}")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError(f"history session is missing provider: {normalized}")
+    if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+        reasoning_effort = None
+    if not isinstance(messages, list):
+        raise ValueError(f"history session has invalid messages: {normalized}")
+    if not isinstance(responses_items, list):
+        raise ValueError(f"history session has invalid responses_items: {normalized}")
+    if not isinstance(created_at, str) or not created_at.strip():
+        created_at = datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    return {
+        "id": normalize_session_id(stored_id) if isinstance(stored_id, str) and stored_id.strip() else normalized,
+        "model": model,
+        "provider": provider,
+        "reasoning_effort": reasoning_effort,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "messages": messages,
+        "responses_items": responses_items,
+    }
+
+
+def list_conversation_histories() -> list[dict[str, Any]]:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    sessions: list[dict[str, Any]] = []
+    for path in sorted(HISTORY_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        history = data.get("history") if isinstance(data.get("history"), dict) else {}
+        messages = history.get("messages", data.get("messages", []))
+        if not isinstance(messages, list):
+            messages = []
+
+        session_id = data.get("id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            session_id = path.stem
+
+        created_at = data.get("created_at")
+        if not isinstance(created_at, str) or not created_at.strip():
+            created_at = datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+        updated_at = data.get("updated_at")
+        if not isinstance(updated_at, str) or not updated_at.strip():
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+        sessions.append(
+            {
+                "id": normalize_session_id(session_id),
+                "provider": data.get("provider") or "",
+                "model": data.get("model") or "",
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "first_prompt": summarize_prompt(first_user_prompt(messages)),
+            }
+        )
+
+    sessions.sort(key=lambda item: cast(str, item["updated_at"]), reverse=True)
+    return sessions
 
 
 def _coerce_expires_at(value: Any) -> float:
@@ -1216,17 +1361,30 @@ class NanoAgent:
         api_key: str | None = None,
         base_url: str | None = None,
         reasoning_effort: str | None = None,
+        session_id: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
         self.cwd = cwd.resolve()
         self.provider = provider
+        self.session_id = normalize_session_id(session_id) if session_id else str(uuid.uuid4())
+        self.history_path = conversation_history_path(self.session_id)
         self.reasoning_effort = None if reasoning_effort in {None, "none"} else reasoning_effort
+        self.created_at = iso_now()
+        if self.history_path.exists():
+            try:
+                existing = load_conversation_history(self.session_id)
+                self.created_at = cast(str, existing["created_at"])
+            except Exception:
+                pass
         self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
-        self.messages: list[dict[str, Any]] = []
-        self.responses_items: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = list(messages or [])
+        self.responses_items: list[dict[str, Any]] = list(responses_items or [])
         self.bash = BashRunner(self.cwd)
         self.active_skills: set[str] = set()
         self.ui = ChatUI()
+        self.save_history()
 
     def completion_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
@@ -1240,7 +1398,26 @@ class NanoAgent:
         return {"effort": self.reasoning_effort, "summary": "auto"}
 
     def close(self) -> None:
+        self.save_history()
         self.bash.close()
+
+    def serialized_history(self) -> dict[str, Any]:
+        return {
+            "id": self.session_id,
+            "provider": self.provider,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "created_at": self.created_at,
+            "updated_at": iso_now(),
+            "history": {
+                "messages": self.messages,
+                "responses_items": self.responses_items,
+            },
+        }
+
+    def save_history(self) -> None:
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        self.history_path.write_text(json.dumps(self.serialized_history(), indent=2) + "\n")
 
     def current_skills(self) -> dict[str, SkillInfo]:
         return discover_skills(self.cwd)
@@ -1582,6 +1759,7 @@ The skill directory is located at: {skill.directory}
             await self.send_via_responses()
         else:
             await self.send_via_chat_completions()
+        self.save_history()
 
 
 async def run_chat(
@@ -1591,6 +1769,11 @@ async def run_chat(
     api_key: str | None = None,
     base_url: str | None = None,
     reasoning_effort: str | None = None,
+    session_id: str | None = None,
+    resumed: bool = False,
+    messages: list[dict[str, Any]] | None = None,
+    responses_items: list[dict[str, Any]] | None = None,
+    created_at: str | None = None,
 ) -> None:
     agent = NanoAgent(
         model=model,
@@ -1599,13 +1782,18 @@ async def run_chat(
         api_key=api_key,
         base_url=base_url,
         reasoning_effort=reasoning_effort,
+        session_id=session_id,
+        messages=messages,
+        responses_items=responses_items,
     )
+    if created_at:
+        agent.created_at = created_at
     try:
         if prompt is not None:
             await agent.send(prompt)
             return
 
-        agent.ui.startup(provider, model, reasoning_effort)
+        agent.ui.startup(provider, model, reasoning_effort, agent.session_id, resumed=resumed)
         while True:
             try:
                 user_input = await agent.ui.prompt()
@@ -1618,6 +1806,7 @@ async def run_chat(
                 break
             await agent.send(user_input)
     finally:
+        agent.ui.show_session_exit(agent.session_id)
         agent.close()
 
 
@@ -1679,6 +1868,7 @@ def main(
 @cast(Any, main).command(
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
 )
+@click.option("--resume", default=None, help="Resume a saved conversation by session UUID")
 @click.option(
     "--provider",
     type=click.Choice(["copilot", "openai"], case_sensitive=False),
@@ -1699,6 +1889,7 @@ def main(
 def run(
     ctx: click.Context,
     prompt_args: tuple[str, ...],
+    resume: str | None,
     provider: str | None,
     model: str | None,
     api_key: str | None,
@@ -1708,11 +1899,47 @@ def run(
     """Run the nano agent chat loop or send a one-shot prompt."""
     prompt = " ".join(prompt_args).strip() or None
     config = ctx.find_root().obj or {}
-    resolved_provider = provider or cast(str, config["provider"])
-    resolved_model = model or cast(str, config["model"])
+    resumed = False
+    session_id: str | None = None
+    restored_messages: list[dict[str, Any]] | None = None
+    restored_responses_items: list[dict[str, Any]] | None = None
+    restored_provider: str | None = None
+    restored_model: str | None = None
+    restored_reasoning_effort: str | None = None
+    restored_created_at: str | None = None
+
+    if resume:
+        loaded = load_conversation_history(resume)
+        resumed = True
+        session_id = cast(str, loaded["id"])
+        restored_provider = cast(str, loaded["provider"])
+        restored_model = cast(str, loaded["model"])
+        restored_reasoning_effort = cast(str | None, loaded["reasoning_effort"])
+        restored_created_at = cast(str, loaded["created_at"])
+        restored_messages = cast(list[dict[str, Any]], loaded["messages"])
+        restored_responses_items = cast(list[dict[str, Any]], loaded["responses_items"])
+
+    provider_source = ctx.get_parameter_source("provider")
+    model_source = ctx.get_parameter_source("model")
+    reasoning_source = ctx.get_parameter_source("reasoning_effort")
+
+    resolved_provider = (
+        provider
+        if provider_source not in {None, ParameterSource.DEFAULT}
+        else restored_provider or cast(str, config["provider"])
+    )
+    resolved_model = (
+        model
+        if model_source not in {None, ParameterSource.DEFAULT}
+        else restored_model or cast(str, config["model"])
+    )
     resolved_api_key = api_key if api_key is not None else cast(str | None, config["api_key"])
     resolved_base_url = base_url if base_url is not None else cast(str | None, config["base_url"])
-    resolved_reasoning_effort = reasoning_effort or cast(str, config["reasoning_effort"])
+    resolved_reasoning_effort = (
+        reasoning_effort
+        if reasoning_source not in {None, ParameterSource.DEFAULT}
+        else restored_reasoning_effort or cast(str, config["reasoning_effort"])
+    )
 
     try:
         asyncio.run(
@@ -1723,6 +1950,11 @@ def run(
                 api_key=resolved_api_key,
                 base_url=resolved_base_url,
                 reasoning_effort=resolved_reasoning_effort,
+                session_id=session_id,
+                resumed=resumed,
+                messages=restored_messages,
+                responses_items=restored_responses_items,
+                created_at=restored_created_at,
             )
         )
     except CopilotAuthError as exc:
@@ -1731,6 +1963,48 @@ def run(
         raise click.ClickException(str(exc)) from exc
     except KeyboardInterrupt:
         click.echo()
+
+
+@cast(Any, main).command(name="chat", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@click.option("--resume", default=None, help="Resume a saved conversation by session UUID")
+@click.option(
+    "--provider",
+    type=click.Choice(["copilot", "openai"], case_sensitive=False),
+    default=None,
+    help="LLM provider to use",
+)
+@click.option("--model", default=None, help="Model to use")
+@click.option("--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode")
+@click.option("--base-url", default=None, help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--reasoning-effort",
+    type=click.Choice(["none", "minimal", "low", "medium", "high"], case_sensitive=False),
+    default=None,
+    help="Reasoning effort for supported models",
+)
+@click.argument("prompt_args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def chat(
+    ctx: click.Context,
+    prompt_args: tuple[str, ...],
+    resume: str | None,
+    provider: str | None,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    reasoning_effort: str | None,
+) -> None:
+    """Alias for run."""
+    ctx.invoke(
+        run,
+        prompt_args=prompt_args,
+        resume=resume,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 @cast(Any, main).command()
@@ -1743,6 +2017,32 @@ def login(output: Path | None) -> None:
         raise click.ClickException("Authentication cancelled")
     except Exception as exc:
         raise click.ClickException(f"Authentication failed: {exc}") from exc
+
+
+@cast(Any, main).command(name="history")
+def history_command() -> None:
+    """List saved conversation history."""
+    console = Console()
+    sessions = list_conversation_histories()
+    if not sessions:
+        console.print("No saved history.")
+        return
+
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("UUID", style="green", no_wrap=True)
+    table.add_column("First prompt")
+    table.add_column("Created at", style="dim", no_wrap=True)
+    table.add_column("Updated at", style="dim", no_wrap=True)
+
+    for session in sessions:
+        table.add_row(
+            cast(str, session["id"]),
+            cast(str, session["first_prompt"]),
+            cast(str, session["created_at"]),
+            cast(str, session["updated_at"]),
+        )
+
+    console.print(table)
 
 
 if __name__ == "__main__":
