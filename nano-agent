@@ -152,7 +152,7 @@ def load_copilot_credentials() -> dict[str, Any]:
     path = credentials_path()
     if not path.exists():
         raise CopilotAuthError(
-            f"Copilot credentials not found at {path}. Run 'uv run python nano_agent.py login' first."
+            f"Copilot credentials not found at {path}. Run 'nano-agent login' first."
         )
     return json.loads(path.read_text())
 
@@ -1347,7 +1347,6 @@ class NanoAgent:
                 "instructions": build_system_prompt(self.cwd),
                 "tools": chat_tools_to_responses_tools(chat_tools),
                 "tool_choice": "auto",
-                "store": True,
             }
             reasoning = self.responses_reasoning()
             if reasoning:
@@ -1656,21 +1655,78 @@ def main(
     base_url: str | None,
     reasoning_effort: str,
 ) -> None:
-    """Nano agent using chat completions via Copilot or OpenAI."""
+    """Nano agent CLI."""
+    ctx.ensure_object(dict)
+    ctx.obj.update(
+        {
+            "provider": provider,
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "reasoning_effort": reasoning_effort,
+        }
+    )
+
     if ctx.invoked_subcommand is not None:
         return
 
-    prompt = " ".join(ctx.args).strip() or None
+    if ctx.args:
+        ctx.invoke(
+            run,
+            prompt_args=tuple(ctx.args),
+        )
+        return
+
+    raise click.UsageError("Specify a subcommand such as 'run' or 'login'.")
+
+
+@cast(Any, main).command(
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
+@click.option(
+    "--provider",
+    type=click.Choice(["copilot", "openai"], case_sensitive=False),
+    default=None,
+    help="LLM provider to use",
+)
+@click.option("--model", default=None, help="Model to use")
+@click.option("--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode")
+@click.option("--base-url", default=None, help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--reasoning-effort",
+    type=click.Choice(["none", "minimal", "low", "medium", "high"], case_sensitive=False),
+    default=None,
+    help="Reasoning effort for supported models",
+)
+@click.argument("prompt_args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def run(
+    ctx: click.Context,
+    prompt_args: tuple[str, ...],
+    provider: str | None,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    reasoning_effort: str | None,
+) -> None:
+    """Run the nano agent chat loop or send a one-shot prompt."""
+    prompt = " ".join(prompt_args).strip() or None
+    config = ctx.find_root().obj or {}
+    resolved_provider = provider or cast(str, config["provider"])
+    resolved_model = model or cast(str, config["model"])
+    resolved_api_key = api_key if api_key is not None else cast(str | None, config["api_key"])
+    resolved_base_url = base_url if base_url is not None else cast(str | None, config["base_url"])
+    resolved_reasoning_effort = reasoning_effort or cast(str, config["reasoning_effort"])
 
     try:
         asyncio.run(
             run_chat(
-                model=model,
+                model=resolved_model,
                 prompt=prompt,
-                provider=provider,
-                api_key=api_key,
-                base_url=base_url,
-                reasoning_effort=reasoning_effort,
+                provider=resolved_provider,
+                api_key=resolved_api_key,
+                base_url=resolved_base_url,
+                reasoning_effort=resolved_reasoning_effort,
             )
         )
     except CopilotAuthError as exc:
