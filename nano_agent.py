@@ -805,6 +805,82 @@ def _ordered_tool_calls(accumulator: dict[int, dict[str, Any]]) -> list[dict[str
     return [accumulator[index] for index in sorted(accumulator)]
 
 
+def should_use_responses_api(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized.startswith("gpt-5") or "codex" in normalized
+
+
+def chat_messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "user":
+            items.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message.get("content") or ""}],
+                }
+            )
+        elif role == "assistant":
+            content = message.get("content")
+            if content:
+                items.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                    }
+                )
+        elif role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id"),
+                    "output": message.get("content") or "",
+                }
+            )
+    return items
+
+
+def extract_function_calls_from_response(response: Any) -> list[dict[str, Any]]:
+    plain = _to_plain_data(response) or {}
+    output = plain.get("output") or []
+    calls: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "custom_tool_call"}:
+            calls.append(
+                {
+                    "id": item.get("id"),
+                    "call_id": item.get("call_id") or item.get("id"),
+                    "type": item_type,
+                    "function": {
+                        "name": item.get("name") or "",
+                        "arguments": item.get("arguments") or "",
+                    },
+                }
+            )
+    return calls
+
+
+def chat_tools_to_responses_tools(chat_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for tool in chat_tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            continue
+        tools.append(
+            {
+                "type": "function",
+                "name": function.get("name") or "",
+                "description": function.get("description") or "",
+                "parameters": function.get("parameters") or {},
+            }
+        )
+    return tools
+
+
 class PersistentBashSession:
     def __init__(self) -> None:
         self.proc: subprocess.Popen[bytes] | None = None
@@ -1197,6 +1273,11 @@ class NanoAgent:
             kwargs["reasoning_effort"] = self.reasoning_effort
         return kwargs
 
+    def responses_reasoning(self) -> dict[str, Any] | None:
+        if not self.reasoning_effort:
+            return None
+        return {"effort": self.reasoning_effort, "summary": "auto"}
+
     def close(self) -> None:
         self.bash.close()
 
@@ -1241,6 +1322,39 @@ class NanoAgent:
 
     async def extract_from_markdown(self, prompt: str, markdown: str) -> str:
         limited = markdown[:50000]
+        if should_use_responses_api(self.model):
+            kwargs: dict[str, Any] = {
+                "model": self.model,
+                "instructions": "You extract only the information requested from supplied web content. If the answer is not present, say so plainly.",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"Request: {prompt}\n\nWeb content:\n\n{limited}",
+                            }
+                        ],
+                    }
+                ],
+            }
+            reasoning = self.responses_reasoning()
+            if reasoning:
+                kwargs["reasoning"] = reasoning
+            response = await self.client.responses.create(**kwargs)
+            plain = _to_plain_data(response) or {}
+            output_text = getattr(response, "output_text", None)
+            if isinstance(output_text, str) and output_text:
+                return output_text
+            fragments: list[str] = []
+            for item in plain.get("output") or []:
+                if not isinstance(item, dict):
+                    continue
+                for content_item in item.get("content") or []:
+                    if isinstance(content_item, dict) and isinstance(content_item.get("text"), str):
+                        fragments.append(content_item["text"])
+            return "".join(fragments)
+
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -1256,6 +1370,156 @@ class NanoAgent:
             **self.completion_kwargs(),
         )
         return response.choices[0].message.content or ""
+
+    async def send_via_responses(self) -> None:
+        previous_response_id: str | None = None
+        pending_input = chat_messages_to_responses_input(self.messages)
+
+        while True:
+            self.ui.begin_assistant()
+            chat_tools = self.tool_specs()
+            kwargs: dict[str, Any] = {
+                "model": self.model,
+                "input": pending_input,
+                "instructions": build_system_prompt(self.cwd),
+                "tools": chat_tools_to_responses_tools(chat_tools),
+                "tool_choice": "auto",
+            }
+            if previous_response_id:
+                kwargs["previous_response_id"] = previous_response_id
+            reasoning = self.responses_reasoning()
+            if reasoning:
+                kwargs["reasoning"] = reasoning
+
+            async with self.client.responses.stream(**kwargs) as stream:
+                async for event in stream:
+                    event_type = getattr(event, "type", None)
+                    if event_type == "response.output_text.delta":
+                        delta = cast(str, getattr(event, "delta", ""))
+                        if delta:
+                            self.ui.update_assistant(text_fragment=delta)
+                    elif event_type in {
+                        "response.reasoning_text.delta",
+                        "response.reasoning_summary_text.delta",
+                    }:
+                        delta = cast(str, getattr(event, "delta", ""))
+                        if delta:
+                            self.ui.update_assistant(reasoning_fragment=delta)
+
+                final_response = await stream.get_final_response()
+
+            self.ui.end_assistant()
+
+            previous_response_id = getattr(final_response, "id", None)
+            output_text = getattr(final_response, "output_text", None)
+            assistant_text = output_text if isinstance(output_text, str) and output_text else None
+            self.messages.append({"role": "assistant", "content": assistant_text})
+
+            function_calls = extract_function_calls_from_response(final_response)
+            if not function_calls:
+                return
+
+            tool_outputs: list[dict[str, Any]] = []
+            for call in function_calls:
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError as exc:
+                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
+                else:
+                    result = await self.run_tool(call["function"]["name"], args)
+                self.ui.show_tool_result(call["function"]["name"], result)
+                tool_content = json.dumps(result, ensure_ascii=False)
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["call_id"],
+                        "content": tool_content,
+                    }
+                )
+                tool_outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call["call_id"],
+                        "output": tool_content,
+                    }
+                )
+
+            pending_input = tool_outputs
+
+    async def send_via_chat_completions(self) -> None:
+        while True:
+            assistant_content_parts: list[str] = []
+            tool_call_parts: dict[int, dict[str, Any]] = {}
+            self.ui.begin_assistant()
+
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": build_system_prompt(self.cwd)},
+                    *self.messages,
+                ],
+                tools=self.tool_specs(),
+                tool_choice="auto",
+                stream=True,
+                **self.completion_kwargs(),
+            )
+
+            async for chunk in stream:
+                choice = chunk.choices[0] if getattr(chunk, "choices", None) else None
+                if choice is None:
+                    continue
+
+                delta = _to_plain_data(choice.delta) or {}
+
+                for fragment in _get_delta_fragments(delta, ["reasoning", "thinking"]):
+                    if fragment:
+                        self.ui.update_assistant(reasoning_fragment=fragment)
+
+                content = delta.get("content")
+                if isinstance(content, str):
+                    self.ui.update_assistant(text_fragment=content)
+                    assistant_content_parts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        item_plain = _to_plain_data(item)
+                        if isinstance(item_plain, dict):
+                            for fragment in _extract_text_fragments(item_plain):
+                                self.ui.update_assistant(text_fragment=fragment)
+                                assistant_content_parts.append(fragment)
+
+                for streamed_tool_call in delta.get("tool_calls") or []:
+                    _merge_stream_tool_call(tool_call_parts, streamed_tool_call)
+
+            self.ui.end_assistant()
+
+            message_tool_calls = _ordered_tool_calls(tool_call_parts)
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": "".join(assistant_content_parts) or None,
+            }
+            if message_tool_calls:
+                assistant_message["tool_calls"] = message_tool_calls
+
+            self.messages.append(assistant_message)
+
+            if not message_tool_calls:
+                return
+
+            for call in message_tool_calls:
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError as exc:
+                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
+                else:
+                    result = await self.run_tool(call["function"]["name"], args)
+                self.ui.show_tool_result(call["function"]["name"], result)
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
 
     async def run_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1346,79 +1610,10 @@ The skill directory is located at: {skill.directory}
 
     async def send(self, user_input: str) -> None:
         self.messages.append({"role": "user", "content": user_input})
-        while True:
-            assistant_content_parts: list[str] = []
-            tool_call_parts: dict[int, dict[str, Any]] = {}
-            self.ui.begin_assistant()
-
-            stream = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": build_system_prompt(self.cwd)},
-                    *self.messages,
-                ],
-                tools=self.tool_specs(),
-                tool_choice="auto",
-                stream=True,
-                **self.completion_kwargs(),
-            )
-
-            async for chunk in stream:
-                choice = chunk.choices[0] if getattr(chunk, "choices", None) else None
-                if choice is None:
-                    continue
-
-                delta = _to_plain_data(choice.delta) or {}
-
-                for fragment in _get_delta_fragments(delta, ["reasoning", "thinking"]):
-                    if fragment:
-                        self.ui.update_assistant(reasoning_fragment=fragment)
-
-                content = delta.get("content")
-                if isinstance(content, str):
-                    self.ui.update_assistant(text_fragment=content)
-                    assistant_content_parts.append(content)
-                elif isinstance(content, list):
-                    for item in content:
-                        item_plain = _to_plain_data(item)
-                        if isinstance(item_plain, dict):
-                            for fragment in _extract_text_fragments(item_plain):
-                                self.ui.update_assistant(text_fragment=fragment)
-                                assistant_content_parts.append(fragment)
-
-                for streamed_tool_call in delta.get("tool_calls") or []:
-                    _merge_stream_tool_call(tool_call_parts, streamed_tool_call)
-
-            self.ui.end_assistant()
-
-            message_tool_calls = _ordered_tool_calls(tool_call_parts)
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": "".join(assistant_content_parts) or None,
-            }
-            if message_tool_calls:
-                assistant_message["tool_calls"] = message_tool_calls
-
-            self.messages.append(assistant_message)
-
-            if not message_tool_calls:
-                return
-
-            for call in message_tool_calls:
-                try:
-                    args = json.loads(call["function"].get("arguments") or "{}")
-                except json.JSONDecodeError as exc:
-                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
-                else:
-                    result = await self.run_tool(call["function"]["name"], args)
-                self.ui.show_tool_result(call["function"]["name"], result)
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
-                )
+        if should_use_responses_api(self.model):
+            await self.send_via_responses()
+        else:
+            await self.send_via_chat_completions()
 
 
 async def run_chat(
