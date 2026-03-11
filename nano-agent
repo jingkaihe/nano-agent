@@ -6,7 +6,6 @@
 #   "openai>=1.68.2",
 #   "httpx>=0.28.1",
 #   "prompt_toolkit>=3.0.47",
-#   "requests>=2.32.3",
 #   "PyYAML>=6.0.2",
 #   "markdownify>=0.13.1",
 #   "Jinja2>=3.1.4",
@@ -33,7 +32,6 @@ from typing import Any, cast
 from urllib.parse import urljoin, urlparse
 
 import httpx
-import requests
 import yaml
 import click
 from click.core import ParameterSource
@@ -142,7 +140,7 @@ class ChatUI:
                 self.console.print("thinking: ", style="magenta", end="")
                 self._current_stream = "thinking"
                 self._stream_open = True
-            self.console.print(reasoning_fragment, style="dim italic", end="", soft_wrap=True)
+            self.console.print(reasoning_fragment, style="dim italic", end="", soft_wrap=True, markup=False)
 
         if text_fragment:
             if self._current_stream != "assistant":
@@ -152,7 +150,7 @@ class ChatUI:
                 self.console.print("assistant: ", style="blue", end="")
                 self._current_stream = "assistant"
                 self._stream_open = True
-            self.console.print(text_fragment, end="", soft_wrap=True)
+            self.console.print(text_fragment, end="", soft_wrap=True, markup=False)
 
     def end_assistant(self) -> None:
         if self._stream_open:
@@ -165,7 +163,7 @@ class ChatUI:
         style = "green" if result.get("success") else "red"
         self._separator(f"tool:{name}", style)
         self.console.print(f"tool:{name}: ", style=style, end="")
-        self.console.print(rendered, soft_wrap=True)
+        self.console.print(rendered, soft_wrap=True, markup=False)
 
     def newline(self) -> None:
         self.console.print()
@@ -350,7 +348,7 @@ def refresh_copilot_token(creds: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if expires_at > refresh_threshold:
         return creds["copilot_token"], creds
 
-    response = requests.get(
+    response = httpx.get(
         COPILOT_EXCHANGE_URL,
         headers={
             "Authorization": f"Bearer {creds['access_token']}",
@@ -409,7 +407,7 @@ def create_client(provider: str, api_key: str | None = None, base_url: str | Non
 
 
 def generate_device_flow() -> dict[str, Any]:
-    response = requests.post(
+    response = httpx.post(
         COPILOT_DEVICE_URL,
         data={
             "client_id": COPILOT_CLIENT_ID,
@@ -430,7 +428,7 @@ def poll_for_token(device_code: str, interval: int, expires_in: int) -> dict[str
     current_interval = interval
     while time.time() < timeout_at:
         time.sleep(current_interval)
-        response = requests.post(
+        response = httpx.post(
             COPILOT_TOKEN_URL,
             data={
                 "client_id": COPILOT_CLIENT_ID,
@@ -457,7 +455,7 @@ def poll_for_token(device_code: str, interval: int, expires_in: int) -> dict[str
 
 
 def exchange_for_copilot_token(access_token: str) -> dict[str, Any]:
-    response = requests.get(
+    response = httpx.get(
         COPILOT_EXCHANGE_URL,
         headers={
             "Authorization": f"Bearer {access_token}",
