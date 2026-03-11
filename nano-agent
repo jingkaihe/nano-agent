@@ -1087,6 +1087,10 @@ def _context_window_limit(model: str) -> int | None:
     return None
 
 
+def _is_copilot_claude_chat(provider: str, model: str) -> bool:
+    return _is_copilot_provider(provider) and _is_anthropic_like_model(model) and not should_use_responses_api(model)
+
+
 def _format_ratio(value: int, total: int | None) -> str:
     if not total or total <= 0:
         return _format_int(value)
@@ -1642,6 +1646,11 @@ class NanoAgent:
     def prepare_chat_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return apply_copilot_ephemeral_cache(messages, provider=self.provider, model=self.model)
 
+    def chat_extra_body(self) -> dict[str, Any] | None:
+        if _is_copilot_claude_chat(self.provider, self.model):
+            return {"thinking_budget": 4000}
+        return None
+
     def record_usage(self, usage_value: Any, *, api: str, model: str | None = None) -> None:
         metrics = _extract_usage_metrics(usage_value)
         if not metrics:
@@ -1768,6 +1777,7 @@ class NanoAgent:
                     },
                 ]
             ),
+            extra_body=self.chat_extra_body(),
             **self.completion_kwargs(),
         )
         self.record_usage(getattr(response, "usage", None), api="chat.completions", model=getattr(response, "model", None))
@@ -1857,6 +1867,7 @@ class NanoAgent:
     async def send_via_chat_completions(self) -> None:
         while True:
             assistant_content_parts: list[str] = []
+            assistant_reasoning_parts: list[str] = []
             tool_call_parts: dict[int, dict[str, Any]] = {}
             self.ui.begin_assistant()
             chat_messages = cast(
@@ -1874,11 +1885,13 @@ class NanoAgent:
                 tool_choice="auto",
                 stream=True,
                 stream_options={"include_usage": True},
+                extra_body=self.chat_extra_body(),
                 **self.completion_kwargs(),
             )
 
             final_usage: Any = None
             response_model: str | None = None
+            reasoning_opaque: str | None = None
             async for chunk in stream:
                 response_model = getattr(chunk, "model", response_model)
                 if getattr(chunk, "usage", None) is not None:
@@ -1889,9 +1902,14 @@ class NanoAgent:
 
                 delta = _to_plain_data(choice.delta) or {}
 
-                for fragment in _get_delta_fragments(delta, ["reasoning", "thinking"]):
+                opaque = delta.get("reasoning_opaque")
+                if isinstance(opaque, str) and opaque:
+                    reasoning_opaque = opaque
+
+                for fragment in _get_delta_fragments(delta, ["reasoning_text", "reasoning", "thinking"]):
                     if fragment:
                         self.ui.update_assistant(reasoning_fragment=fragment)
+                        assistant_reasoning_parts.append(fragment)
 
                 content = delta.get("content")
                 if isinstance(content, str):
@@ -1917,6 +1935,10 @@ class NanoAgent:
                 "role": "assistant",
                 "content": "".join(assistant_content_parts) or None,
             }
+            if assistant_reasoning_parts:
+                assistant_message["reasoning_text"] = "".join(assistant_reasoning_parts)
+            if reasoning_opaque:
+                assistant_message["reasoning_opaque"] = reasoning_opaque
             if message_tool_calls:
                 assistant_message["tool_calls"] = message_tool_calls
 
