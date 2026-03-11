@@ -172,6 +172,45 @@ class ChatUI:
         self.console.print(Rule(style="dim"))
         self.console.print(f"[dim]Session saved: {session_id}[/dim]")
 
+    def show_usage_summary(self, usage: SessionUsage, model: str) -> None:
+        if usage.request_count <= 0:
+            return
+
+        self._separator("usage", "yellow")
+        table = Table(show_header=False, box=None, pad_edge=False)
+        table.add_column(style="yellow")
+        table.add_column(style="white")
+
+        table.add_row("Model calls", _format_int(usage.request_count))
+        table.add_row(
+            "Session tokens",
+            f"input {_format_int(usage.input_tokens)} / output {_format_int(usage.output_tokens)} / total {_format_int(usage.total_tokens)}",
+        )
+        table.add_row(
+            "Session cache",
+            f"read {_format_int(usage.cached_input_tokens)} / reasoning {_format_int(usage.reasoning_tokens)}",
+        )
+
+        uncached_last_input = max(usage.last_input_tokens - usage.last_cached_input_tokens, 0)
+        table.add_row(
+            "Last request",
+            f"input {_format_int(usage.last_input_tokens)} (uncached {_format_int(uncached_last_input)}, cached {_format_int(usage.last_cached_input_tokens)}) / output {_format_int(usage.last_output_tokens)}",
+        )
+
+        limit = _context_window_limit(usage.last_model or model)
+        label = "Last context"
+        value = _format_ratio(usage.last_input_tokens, limit)
+        if limit is None:
+            value += " (model limit unavailable)"
+        table.add_row(label, value)
+
+        if usage.last_api:
+            table.add_row("Last API", usage.last_api)
+        if usage.last_model:
+            table.add_row("Last model", usage.last_model)
+
+        self.console.print(table)
+
 
 def credentials_path() -> Path:
     raw = os.getenv("NANO_AGENT_COPILOT_CREDS")
@@ -233,6 +272,7 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
     history = data.get("history") if isinstance(data.get("history"), dict) else {}
     messages = history.get("messages", data.get("messages", []))
     responses_items = history.get("responses_items", data.get("responses_items", []))
+    usage = history.get("usage", data.get("usage", {}))
     stored_id = data.get("id")
     created_at = data.get("created_at")
     updated_at = data.get("updated_at")
@@ -247,6 +287,8 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
         raise ValueError(f"history session has invalid messages: {normalized}")
     if not isinstance(responses_items, list):
         raise ValueError(f"history session has invalid responses_items: {normalized}")
+    if not isinstance(usage, dict):
+        usage = {}
     if not isinstance(created_at, str) or not created_at.strip():
         created_at = datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     if not isinstance(updated_at, str) or not updated_at.strip():
@@ -261,6 +303,7 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
         "updated_at": updated_at,
         "messages": messages,
         "responses_items": responses_items,
+        "usage": usage,
     }
 
 
@@ -605,6 +648,75 @@ class SkillInfo:
     content: str
 
 
+@dataclass
+class SessionUsage:
+    request_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    last_input_tokens: int = 0
+    last_output_tokens: int = 0
+    last_total_tokens: int = 0
+    last_cached_input_tokens: int = 0
+    last_reasoning_tokens: int = 0
+    last_api: str | None = None
+    last_model: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "SessionUsage":
+        if not isinstance(value, dict):
+            return cls()
+        return cls(
+            request_count=_coerce_usage_int(value.get("request_count")),
+            input_tokens=_coerce_usage_int(value.get("input_tokens")),
+            output_tokens=_coerce_usage_int(value.get("output_tokens")),
+            total_tokens=_coerce_usage_int(value.get("total_tokens")),
+            cached_input_tokens=_coerce_usage_int(value.get("cached_input_tokens")),
+            reasoning_tokens=_coerce_usage_int(value.get("reasoning_tokens")),
+            last_input_tokens=_coerce_usage_int(value.get("last_input_tokens")),
+            last_output_tokens=_coerce_usage_int(value.get("last_output_tokens")),
+            last_total_tokens=_coerce_usage_int(value.get("last_total_tokens")),
+            last_cached_input_tokens=_coerce_usage_int(value.get("last_cached_input_tokens")),
+            last_reasoning_tokens=_coerce_usage_int(value.get("last_reasoning_tokens")),
+            last_api=value.get("last_api") if isinstance(value.get("last_api"), str) else None,
+            last_model=value.get("last_model") if isinstance(value.get("last_model"), str) else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_count": self.request_count,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "last_input_tokens": self.last_input_tokens,
+            "last_output_tokens": self.last_output_tokens,
+            "last_total_tokens": self.last_total_tokens,
+            "last_cached_input_tokens": self.last_cached_input_tokens,
+            "last_reasoning_tokens": self.last_reasoning_tokens,
+            "last_api": self.last_api,
+            "last_model": self.last_model,
+        }
+
+    def record(self, usage: dict[str, int], *, api: str, model: str) -> None:
+        self.request_count += 1
+        self.input_tokens += usage["input_tokens"]
+        self.output_tokens += usage["output_tokens"]
+        self.total_tokens += usage["total_tokens"]
+        self.cached_input_tokens += usage["cached_input_tokens"]
+        self.reasoning_tokens += usage["reasoning_tokens"]
+        self.last_input_tokens = usage["input_tokens"]
+        self.last_output_tokens = usage["output_tokens"]
+        self.last_total_tokens = usage["total_tokens"]
+        self.last_cached_input_tokens = usage["cached_input_tokens"]
+        self.last_reasoning_tokens = usage["reasoning_tokens"]
+        self.last_api = api
+        self.last_model = model
+
+
 def parse_skill_file(path: Path) -> SkillInfo | None:
     text = path.read_text(errors="replace")
     match = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.DOTALL)
@@ -914,6 +1026,72 @@ def _to_plain_data(value: Any) -> Any:
     if callable(model_dump):
         return model_dump(exclude_none=True)
     return value
+
+
+def _coerce_usage_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return 0
+
+
+def _extract_usage_metrics(value: Any) -> dict[str, int] | None:
+    plain = _to_plain_data(value)
+    if not isinstance(plain, dict):
+        return None
+
+    if "input_tokens" in plain or "output_tokens" in plain:
+        input_tokens = _coerce_usage_int(plain.get("input_tokens"))
+        output_tokens = _coerce_usage_int(plain.get("output_tokens"))
+        total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (input_tokens + output_tokens)
+        input_details = plain.get("input_tokens_details") if isinstance(plain.get("input_tokens_details"), dict) else {}
+        output_details = plain.get("output_tokens_details") if isinstance(plain.get("output_tokens_details"), dict) else {}
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_input_tokens": _coerce_usage_int(input_details.get("cached_tokens")),
+            "reasoning_tokens": _coerce_usage_int(output_details.get("reasoning_tokens")),
+        }
+
+    if "prompt_tokens" in plain or "completion_tokens" in plain:
+        input_tokens = _coerce_usage_int(plain.get("prompt_tokens"))
+        output_tokens = _coerce_usage_int(plain.get("completion_tokens"))
+        total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (input_tokens + output_tokens)
+        prompt_details = plain.get("prompt_tokens_details") if isinstance(plain.get("prompt_tokens_details"), dict) else {}
+        completion_details = (
+            plain.get("completion_tokens_details") if isinstance(plain.get("completion_tokens_details"), dict) else {}
+        )
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_input_tokens": _coerce_usage_int(prompt_details.get("cached_tokens")),
+            "reasoning_tokens": _coerce_usage_int(completion_details.get("reasoning_tokens")),
+        }
+
+    return None
+
+
+def _format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+def _context_window_limit(model: str) -> int | None:
+    normalized = model.strip().lower()
+    if "claude" in normalized or "anthropic" in normalized:
+        return 200_000
+    return None
+
+
+def _format_ratio(value: int, total: int | None) -> str:
+    if not total or total <= 0:
+        return _format_int(value)
+    percentage = value / total * 100
+    return f"{_format_int(value)} / {_format_int(total)} ({percentage:.1f}%)"
 
 
 def _extract_text_fragments(value: Any) -> list[str]:
@@ -1424,6 +1602,7 @@ class NanoAgent:
         session_id: str | None = None,
         messages: list[dict[str, Any]] | None = None,
         responses_items: list[dict[str, Any]] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.cwd = cwd.resolve()
@@ -1441,6 +1620,7 @@ class NanoAgent:
         self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
         self.messages: list[dict[str, Any]] = list(messages or [])
         self.responses_items: list[dict[str, Any]] = list(responses_items or [])
+        self.usage = SessionUsage.from_dict(usage)
         self.bash = BashRunner(self.cwd)
         self.active_skills: set[str] = set()
         self.ui = ChatUI()
@@ -1462,6 +1642,12 @@ class NanoAgent:
     def prepare_chat_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return apply_copilot_ephemeral_cache(messages, provider=self.provider, model=self.model)
 
+    def record_usage(self, usage_value: Any, *, api: str, model: str | None = None) -> None:
+        metrics = _extract_usage_metrics(usage_value)
+        if not metrics:
+            return
+        self.usage.record(metrics, api=api, model=model or self.model)
+
     def responses_reasoning(self) -> dict[str, Any] | None:
         if not self.reasoning_effort:
             return None
@@ -1482,6 +1668,7 @@ class NanoAgent:
             "history": {
                 "messages": self.messages,
                 "responses_items": self.responses_items,
+                "usage": self.usage.to_dict(),
             },
         }
 
@@ -1553,6 +1740,7 @@ class NanoAgent:
             if reasoning:
                 kwargs["reasoning"] = reasoning
             response = await self.client.responses.create(**kwargs)
+            self.record_usage(getattr(response, "usage", None), api="responses", model=getattr(response, "model", None))
             plain = _to_plain_data(response) or {}
             output_text = getattr(response, "output_text", None)
             if isinstance(output_text, str) and output_text:
@@ -1582,6 +1770,7 @@ class NanoAgent:
             ),
             **self.completion_kwargs(),
         )
+        self.record_usage(getattr(response, "usage", None), api="chat.completions", model=getattr(response, "model", None))
         return response.choices[0].message.content or ""
 
     async def send_via_responses(self) -> None:
@@ -1618,6 +1807,11 @@ class NanoAgent:
                             self.ui.update_assistant(reasoning_fragment=delta)
 
                 final_response = await stream.get_final_response()
+                self.record_usage(
+                    getattr(final_response, "usage", None),
+                    api="responses",
+                    model=getattr(final_response, "model", None),
+                )
 
             self.ui.end_assistant()
 
@@ -1679,10 +1873,16 @@ class NanoAgent:
                 tools=chat_tools,
                 tool_choice="auto",
                 stream=True,
+                stream_options={"include_usage": True},
                 **self.completion_kwargs(),
             )
 
+            final_usage: Any = None
+            response_model: str | None = None
             async for chunk in stream:
+                response_model = getattr(chunk, "model", response_model)
+                if getattr(chunk, "usage", None) is not None:
+                    final_usage = getattr(chunk, "usage", None)
                 choice = chunk.choices[0] if getattr(chunk, "choices", None) else None
                 if choice is None:
                     continue
@@ -1707,6 +1907,8 @@ class NanoAgent:
 
                 for streamed_tool_call in delta.get("tool_calls") or []:
                     _merge_stream_tool_call(tool_call_parts, streamed_tool_call)
+
+            self.record_usage(final_usage, api="chat.completions", model=response_model)
 
             self.ui.end_assistant()
 
@@ -1853,6 +2055,7 @@ async def run_chat(
     resumed: bool = False,
     messages: list[dict[str, Any]] | None = None,
     responses_items: list[dict[str, Any]] | None = None,
+    usage: dict[str, Any] | None = None,
     created_at: str | None = None,
 ) -> None:
     agent = NanoAgent(
@@ -1865,6 +2068,7 @@ async def run_chat(
         session_id=session_id,
         messages=messages,
         responses_items=responses_items,
+        usage=usage,
     )
     if created_at:
         agent.created_at = created_at
@@ -1886,6 +2090,7 @@ async def run_chat(
                 break
             await agent.send(user_input)
     finally:
+        agent.ui.show_usage_summary(agent.usage, agent.model)
         agent.ui.show_session_exit(agent.session_id)
         agent.close()
 
@@ -1987,6 +2192,7 @@ def run(
     restored_model: str | None = None
     restored_reasoning_effort: str | None = None
     restored_created_at: str | None = None
+    restored_usage: dict[str, Any] | None = None
 
     if resume:
         loaded = load_conversation_history(resume)
@@ -1998,6 +2204,7 @@ def run(
         restored_created_at = cast(str, loaded["created_at"])
         restored_messages = cast(list[dict[str, Any]], loaded["messages"])
         restored_responses_items = cast(list[dict[str, Any]], loaded["responses_items"])
+        restored_usage = cast(dict[str, Any], loaded["usage"])
 
     provider_source = ctx.get_parameter_source("provider")
     model_source = ctx.get_parameter_source("model")
@@ -2034,6 +2241,7 @@ def run(
                 resumed=resumed,
                 messages=restored_messages,
                 responses_items=restored_responses_items,
+                usage=restored_usage,
                 created_at=restored_created_at,
             )
         )
