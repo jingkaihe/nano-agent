@@ -37,13 +37,9 @@ import click
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
-from rich.console import Console, Group
-from rich.json import JSON as RichJSON
-from rich.live import Live
-from rich.panel import Panel
+from rich.console import Console
 from rich.prompt import Prompt
 from rich.rule import Rule
-from rich.text import Text
 
 
 COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
@@ -68,9 +64,12 @@ class CopilotAuthError(Exception):
 class ChatUI:
     def __init__(self) -> None:
         self.console = Console()
-        self._assistant_live: Live | None = None
-        self._assistant_text = Text()
-        self._reasoning_text = Text(style="dim italic")
+        self._current_stream: str | None = None
+        self._stream_open = False
+
+    def _separator(self, label: str, style: str) -> None:
+        self.console.print()
+        self.console.print(Rule(f"[{style}]{label}[/{style}]", style=style))
 
     def startup(self, provider: str, model: str, reasoning_effort: str | None) -> None:
         subtitle = f"{provider} / {model}"
@@ -80,51 +79,46 @@ class ChatUI:
         self.console.print("[dim]Type /exit to quit.[/dim]")
 
     def prompt(self) -> str:
+        self._separator("user", "green")
         return Prompt.ask("[bold green]You[/bold green]").strip()
 
     def begin_assistant(self) -> None:
-        self._assistant_text = Text()
-        self._reasoning_text = Text(style="dim italic")
-        group = Group(
-            Panel(self._assistant_text or Text("…", style="dim"), title="Assistant", border_style="blue"),
-        )
-        live = Live(group, console=self.console, refresh_per_second=12)
-        self._assistant_live = live
-        live.start()
+        self._current_stream = None
+        self._stream_open = False
 
     def update_assistant(self, text_fragment: str = "", reasoning_fragment: str = "") -> None:
-        if text_fragment:
-            self._assistant_text.append(text_fragment)
         if reasoning_fragment:
-            self._reasoning_text.append(reasoning_fragment)
-        if not self._assistant_live:
-            return
-        renderables: list[Any] = []
-        if self._reasoning_text.plain:
-            renderables.append(Panel(self._reasoning_text, title="Thinking", border_style="magenta"))
-        renderables.append(
-            Panel(
-                self._assistant_text if self._assistant_text.plain else Text("…", style="dim"),
-                title="Assistant",
-                border_style="blue",
-            )
-        )
-        self._assistant_live.update(Group(*renderables))
+            if self._current_stream != "thinking":
+                if self._stream_open:
+                    self.console.print()
+                self._separator("thinking", "magenta")
+                self.console.print("thinking: ", style="magenta", end="")
+                self._current_stream = "thinking"
+                self._stream_open = True
+            self.console.print(reasoning_fragment, style="dim italic", end="", soft_wrap=True)
+
+        if text_fragment:
+            if self._current_stream != "assistant":
+                if self._stream_open:
+                    self.console.print()
+                self._separator("assistant", "blue")
+                self.console.print("assistant: ", style="blue", end="")
+                self._current_stream = "assistant"
+                self._stream_open = True
+            self.console.print(text_fragment, end="", soft_wrap=True)
 
     def end_assistant(self) -> None:
-        if self._assistant_live:
-            self._assistant_live.stop()
-            self._assistant_live = None
+        if self._stream_open:
+            self.console.print()
+        self._current_stream = None
+        self._stream_open = False
 
     def show_tool_result(self, name: str, result: dict[str, Any]) -> None:
-        border = "green" if result.get("success") else "red"
-        self.console.print(
-            Panel(
-                RichJSON.from_data(result),
-                title=f"tool: {name}",
-                border_style=border,
-            )
-        )
+        rendered = json.dumps(result, ensure_ascii=False)
+        style = "green" if result.get("success") else "red"
+        self._separator(f"tool:{name}", style)
+        self.console.print(f"tool:{name}: ", style=style, end="")
+        self.console.print(rendered, soft_wrap=True)
 
     def newline(self) -> None:
         self.console.print()
