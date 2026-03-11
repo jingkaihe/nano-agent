@@ -980,6 +980,68 @@ def should_use_responses_api(model: str) -> bool:
     return normalized.startswith("gpt-5") or "codex" in normalized
 
 
+def _is_copilot_provider(provider: str) -> bool:
+    return provider.strip().lower() == "copilot"
+
+
+def _is_anthropic_like_model(model: str) -> bool:
+    normalized = model.strip().lower()
+    return "anthropic" in normalized or "claude" in normalized
+
+
+def apply_copilot_ephemeral_cache(
+    messages: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+) -> list[dict[str, Any]]:
+    if not _is_copilot_provider(provider) or not _is_anthropic_like_model(model):
+        return messages
+
+    system_indexes = [index for index, message in enumerate(messages) if message.get("role") == "system"][:2]
+    final_indexes = [index for index, message in enumerate(messages) if message.get("role") != "system"][-2:]
+
+    target_indexes: list[int] = []
+    seen_indexes: set[int] = set()
+    for index in [*system_indexes, *final_indexes]:
+        if index in seen_indexes:
+            continue
+        seen_indexes.add(index)
+        target_indexes.append(index)
+
+    if not target_indexes:
+        return messages
+
+    patched = list(messages)
+    for index in target_indexes:
+        original = patched[index]
+        updated = dict(original)
+        content = updated.get("content")
+        if isinstance(content, list) and content:
+            last_part = content[-1]
+            if isinstance(last_part, dict):
+                updated_content = list(content)
+                updated_part = dict(last_part)
+                existing = updated_part.get("copilot_cache_control")
+                updated_part["copilot_cache_control"] = {
+                    **(existing if isinstance(existing, dict) else {}),
+                    "type": "ephemeral",
+                }
+                updated_content[-1] = updated_part
+                updated["content"] = updated_content
+                patched[index] = updated
+                continue
+
+        existing = updated.get("copilot_cache_control")
+        updated["copilot_cache_control"] = {
+            **(existing if isinstance(existing, dict) else {}),
+            "type": "ephemeral",
+        }
+        patched[index] = updated
+
+    return patched
+
+
 def extract_function_calls_from_response(response: Any) -> list[dict[str, Any]]:
     plain = _to_plain_data(response) or {}
     output = plain.get("output") or []
@@ -1388,7 +1450,17 @@ class NanoAgent:
         kwargs: dict[str, Any] = {}
         if self.reasoning_effort:
             kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.provider.strip().lower() == "openai":
+            kwargs["prompt_cache_key"] = self.session_id
         return kwargs
+
+    def responses_prompt_cache_key(self) -> str | None:
+        if self.provider.strip().lower() not in {"openai", "copilot"}:
+            return None
+        return self.session_id
+
+    def prepare_chat_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return apply_copilot_ephemeral_cache(messages, provider=self.provider, model=self.model)
 
     def responses_reasoning(self) -> dict[str, Any] | None:
         if not self.reasoning_effort:
@@ -1474,6 +1546,9 @@ class NanoAgent:
                     }
                 ],
             }
+            prompt_cache_key = self.responses_prompt_cache_key()
+            if prompt_cache_key:
+                kwargs["prompt_cache_key"] = prompt_cache_key
             reasoning = self.responses_reasoning()
             if reasoning:
                 kwargs["reasoning"] = reasoning
@@ -1493,16 +1568,18 @@ class NanoAgent:
 
         response = await self.client.chat.completions.create(
             model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You extract only the information requested from supplied web content. If the answer is not present, say so plainly.",
-                },
-                {
-                    "role": "user",
-                    "content": f"Request: {prompt}\n\nWeb content:\n\n{limited}",
-                },
-            ],
+            messages=self.prepare_chat_messages(
+                [
+                    {
+                        "role": "system",
+                        "content": "You extract only the information requested from supplied web content. If the answer is not present, say so plainly.",
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Request: {prompt}\n\nWeb content:\n\n{limited}",
+                    },
+                ]
+            ),
             **self.completion_kwargs(),
         )
         return response.choices[0].message.content or ""
@@ -1518,6 +1595,9 @@ class NanoAgent:
                 "tools": chat_tools_to_responses_tools(chat_tools),
                 "tool_choice": "auto",
             }
+            prompt_cache_key = self.responses_prompt_cache_key()
+            if prompt_cache_key:
+                kwargs["prompt_cache_key"] = prompt_cache_key
             reasoning = self.responses_reasoning()
             if reasoning:
                 kwargs["reasoning"] = reasoning
@@ -1587,7 +1667,9 @@ class NanoAgent:
             self.ui.begin_assistant()
             chat_messages = cast(
                 list[ChatCompletionMessageParam],
-                [{"role": "system", "content": build_system_prompt(self.cwd)}, *self.messages],
+                self.prepare_chat_messages(
+                    [{"role": "system", "content": build_system_prompt(self.cwd)}, *self.messages]
+                ),
             )
             chat_tools = cast(list[ChatCompletionToolParam], self.tool_specs())
 
