@@ -5,6 +5,7 @@
 #   "click>=8.1.8",
 #   "openai>=1.68.2",
 #   "httpx>=0.28.1",
+#   "prompt_toolkit>=3.0.47",
 #   "requests>=2.32.3",
 #   "PyYAML>=6.0.2",
 #   "markdownify>=0.13.1",
@@ -39,8 +40,12 @@ from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.bindings.named_commands import edit_and_execute
 from rich.console import Console
-from rich.prompt import Prompt
 from rich.rule import Rule
 
 
@@ -68,6 +73,28 @@ class ChatUI:
         self.console = Console()
         self._current_stream: str | None = None
         self._stream_open = False
+        self._prompt_session = PromptSession(
+            multiline=False,
+            history=InMemoryHistory(),
+            key_bindings=self._build_prompt_bindings(),
+        )
+
+    def _build_prompt_bindings(self) -> KeyBindings:
+        bindings = KeyBindings()
+
+        @bindings.add("c-x", "c-e")
+        def _edit_in_editor(event: Any) -> None:
+            edit_and_execute(event)
+
+        @bindings.add("c-d")
+        def _exit_on_empty(event: Any) -> None:
+            if not event.current_buffer.text:
+                event.app.exit(exception=EOFError)
+                return
+
+            event.current_buffer.delete(count=1)
+
+        return bindings
 
     def _separator(self, label: str, style: str) -> None:
         self.console.print()
@@ -79,10 +106,17 @@ class ChatUI:
             subtitle += f" / reasoning={reasoning_effort}"
         self.console.print(Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{subtitle}[/dim]"))
         self.console.print("[dim]Type /exit to quit.[/dim]")
+        self.console.print("[dim]Press Enter to submit. Press Ctrl+X Ctrl+E to edit in $EDITOR. Ctrl+D exits on empty input.[/dim]")
 
-    def prompt(self) -> str:
+    async def prompt(self) -> str:
+        self.console.print()
+        return (await self._prompt_session.prompt_async(
+            HTML("<b><ansigreen>You</ansigreen></b> > "),
+        )).strip()
+
+    def show_user(self, text: str) -> None:
         self._separator("user", "green")
-        return Prompt.ask("[bold green]You[/bold green]").strip()
+        self.console.print(text, soft_wrap=True)
 
     def begin_assistant(self) -> None:
         self._current_stream = None
@@ -1575,6 +1609,7 @@ The skill directory is located at: {skill.directory}
             return {"success": False, "error": str(exc)}
 
     async def send(self, user_input: str) -> None:
+        self.ui.show_user(user_input)
         self.messages.append({"role": "user", "content": user_input})
         if should_use_responses_api(self.model):
             self.responses_items.append(
@@ -1612,7 +1647,7 @@ async def run_chat(
         agent.ui.startup(provider, model, reasoning_effort)
         while True:
             try:
-                user_input = agent.ui.prompt()
+                user_input = await agent.ui.prompt()
             except EOFError:
                 agent.ui.newline()
                 break
