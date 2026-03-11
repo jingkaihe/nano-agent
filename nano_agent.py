@@ -1651,7 +1651,10 @@ async def run_chat(
         agent.close()
 
 
-@click.group(invoke_without_command=True)
+@click.group(
+    invoke_without_command=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 @click.option(
     "--provider",
     type=click.Choice(["copilot", "openai"], case_sensitive=False),
@@ -1669,7 +1672,6 @@ async def run_chat(
     show_default=True,
     help="Reasoning effort for supported models",
 )
-@click.argument("prompt", required=False)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -1678,11 +1680,12 @@ def main(
     api_key: str | None,
     base_url: str | None,
     reasoning_effort: str,
-    prompt: str | None,
 ) -> None:
     """Nano agent using chat completions via Copilot or OpenAI."""
     if ctx.invoked_subcommand is not None:
         return
+
+    prompt = " ".join(ctx.args).strip() or None
 
     try:
         asyncio.run(
