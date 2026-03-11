@@ -22,11 +22,9 @@ import json
 import os
 import platform
 import re
-import select
 import shlex
 import subprocess
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -555,7 +553,7 @@ Skills are currently not available.
 
 def bash_description() -> str:
     return JINJA.from_string(
-        '''Run a bash command in a persistent shell session.
+        '''Run a bash command in an isolated shell process.
 
 # Restrictions
 Banned commands:
@@ -879,67 +877,31 @@ def chat_tools_to_responses_tools(chat_tools: list[dict[str, Any]]) -> list[dict
     return tools
 
 
-class PersistentBashSession:
-    def __init__(self) -> None:
-        self.proc: subprocess.Popen[bytes] | None = None
-
-    def _ensure_started(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            return
-        self.proc = subprocess.Popen(
-            ["bash", "--noprofile", "--norc"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+class BashRunner:
+    def __init__(self, cwd: Path) -> None:
+        self.cwd = cwd
 
     def close(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        return
 
     def run(self, command: str, timeout: int) -> tuple[int, str]:
-        self._ensure_started()
-        assert self.proc and self.proc.stdin and self.proc.stdout
-        token = uuid.uuid4().hex
-        exit_marker = f"__NANO_AGENT_EXIT_{token}__"
-        done_marker = f"__NANO_AGENT_DONE_{token}__"
-        payload = (
-            f"{command}\n"
-            f"printf '\n{exit_marker}:%s\n' \"$?\"\n"
-            f"printf '{done_marker}\n'\n"
-        ).encode()
-        self.proc.stdin.write(payload)
-        self.proc.stdin.flush()
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                cwd=self.cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            raise TimeoutError(f"command timed out after {timeout} seconds\n{output.rstrip()}") from exc
 
-        stdout_fd = self.proc.stdout.fileno()
-        deadline = time.time() + timeout
-        chunks = bytearray()
-
-        while time.time() < deadline:
-            ready, _, _ = select.select([stdout_fd], [], [], 0.1)
-            if not ready:
-                continue
-            chunk = os.read(stdout_fd, 65536)
-            if not chunk:
-                break
-            chunks.extend(chunk)
-            text = chunks.decode(errors="replace")
-            if done_marker in text:
-                before_done = text.split(done_marker, 1)[0]
-                match = re.search(rf"(?s)(.*)\n{re.escape(exit_marker)}:(-?\d+)\n$", before_done)
-                if not match:
-                    return 1, before_done.rstrip()
-                output = match.group(1).rstrip()
-                exit_code = int(match.group(2))
-                return exit_code, output
-
-        self.close()
-        self.proc = None
-        raise TimeoutError(f"command timed out after {timeout} seconds")
+        return result.returncode, result.stdout.rstrip()
 
 
 def validate_bash_args(command: Any, description: Any, timeout: Any) -> tuple[str, str, int]:
@@ -1262,7 +1224,7 @@ class NanoAgent:
         self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
         self.messages: list[dict[str, Any]] = []
         self.responses_items: list[dict[str, Any]] = []
-        self.bash = PersistentBashSession()
+        self.bash = BashRunner(self.cwd)
         self.active_skills: set[str] = set()
         self.ui = ChatUI()
 
