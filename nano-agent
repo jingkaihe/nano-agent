@@ -44,7 +44,6 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.key_binding.bindings.named_commands import edit_and_execute
 from rich.console import Console
 from rich.rule import Rule
 
@@ -84,7 +83,7 @@ class ChatUI:
 
         @bindings.add("c-x", "c-e")
         def _edit_in_editor(event: Any) -> None:
-            edit_and_execute(event)
+            event.current_buffer.open_in_editor(validate_and_handle=False)
 
         @bindings.add("c-d")
         def _exit_on_empty(event: Any) -> None:
