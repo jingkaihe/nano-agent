@@ -806,37 +806,6 @@ def should_use_responses_api(model: str) -> bool:
     return normalized.startswith("gpt-5") or "codex" in normalized
 
 
-def chat_messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for message in messages:
-        role = message.get("role")
-        if role == "user":
-            items.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message.get("content") or ""}],
-                }
-            )
-        elif role == "assistant":
-            content = message.get("content")
-            if content:
-                items.append(
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": content}],
-                    }
-                )
-        elif role == "tool":
-            items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": message.get("tool_call_id"),
-                    "output": message.get("content") or "",
-                }
-            )
-    return items
-
-
 def extract_function_calls_from_response(response: Any) -> list[dict[str, Any]]:
     plain = _to_plain_data(response) or {}
     output = plain.get("output") or []
@@ -1259,6 +1228,7 @@ class NanoAgent:
         self.reasoning_effort = None if reasoning_effort in {None, "none"} else reasoning_effort
         self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
         self.messages: list[dict[str, Any]] = []
+        self.responses_items: list[dict[str, Any]] = []
         self.bash = PersistentBashSession()
         self.active_skills: set[str] = set()
         self.ui = ChatUI()
@@ -1368,21 +1338,17 @@ class NanoAgent:
         return response.choices[0].message.content or ""
 
     async def send_via_responses(self) -> None:
-        previous_response_id: str | None = None
-        pending_input = chat_messages_to_responses_input(self.messages)
-
         while True:
             self.ui.begin_assistant()
             chat_tools = self.tool_specs()
             kwargs: dict[str, Any] = {
                 "model": self.model,
-                "input": pending_input,
+                "input": self.responses_items,
                 "instructions": build_system_prompt(self.cwd),
                 "tools": chat_tools_to_responses_tools(chat_tools),
                 "tool_choice": "auto",
+                "store": True,
             }
-            if previous_response_id:
-                kwargs["previous_response_id"] = previous_response_id
             reasoning = self.responses_reasoning()
             if reasoning:
                 kwargs["reasoning"] = reasoning
@@ -1406,10 +1372,13 @@ class NanoAgent:
 
             self.ui.end_assistant()
 
-            previous_response_id = getattr(final_response, "id", None)
             output_text = getattr(final_response, "output_text", None)
             assistant_text = output_text if isinstance(output_text, str) and output_text else None
             self.messages.append({"role": "assistant", "content": assistant_text})
+            plain_response = _to_plain_data(final_response) or {}
+            output_items = plain_response.get("output") or []
+            if isinstance(output_items, list):
+                self.responses_items.extend(output_items)
 
             function_calls = extract_function_calls_from_response(final_response)
             if not function_calls:
@@ -1440,7 +1409,7 @@ class NanoAgent:
                     }
                 )
 
-            pending_input = tool_outputs
+            self.responses_items.extend(tool_outputs)
 
     async def send_via_chat_completions(self) -> None:
         while True:
@@ -1609,6 +1578,12 @@ The skill directory is located at: {skill.directory}
     async def send(self, user_input: str) -> None:
         self.messages.append({"role": "user", "content": user_input})
         if should_use_responses_api(self.model):
+            self.responses_items.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_input}],
+                }
+            )
             await self.send_via_responses()
         else:
             await self.send_via_chat_completions()
