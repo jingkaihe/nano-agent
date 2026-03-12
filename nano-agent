@@ -24,12 +24,13 @@ import platform
 import re
 import shlex
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -55,6 +56,13 @@ COPILOT_DEVICE_URL = "https://github.com/login/device/code"
 COPILOT_TOKEN_URL = "https://github.com/login/oauth/access_token"
 COPILOT_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 COPILOT_SCOPES = ["read:user", "user:email", "copilot"]
+COPILOT_EDITOR_VERSION = "vscode/1.102.0"
+COPILOT_INTEGRATION_ID = "vscode-chat"
+COPILOT_CHAT_PLUGIN_VERSION = "copilot-chat/0.26.7"
+COPILOT_CHAT_USER_AGENT = "GitHubCopilotChat/0.26.7"
+COPILOT_OPENAI_USER_AGENT = "GithubCopilot/1.342.0"
+COPILOT_GITHUB_API_VERSION = "2025-04-01"
+COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION = "electron-fetch"
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "claude-sonnet-4.5")
 DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
@@ -396,12 +404,7 @@ def refresh_copilot_token(creds: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
     response = httpx.get(
         COPILOT_EXCHANGE_URL,
-        headers={
-            "Authorization": f"Bearer {creds['access_token']}",
-            "Editor-Version": "vscode/1.102.0",
-            "Copilot-Integration-Id": "vscode-chat",
-            "Accept": "application/json",
-        },
+        headers=copilot_token_exchange_headers(creds["access_token"]),
         timeout=30,
     )
     response.raise_for_status()
@@ -420,8 +423,8 @@ def create_openai_copilot_client() -> AsyncOpenAI:
         api_key=copilot_token,
         base_url=base_url,
         default_headers={
-            "User-Agent": "GithubCopilot/1.342.0",
-            "Editor-Version": "vscode/1.102.0",
+            "User-Agent": COPILOT_OPENAI_USER_AGENT,
+            "Editor-Version": COPILOT_EDITOR_VERSION,
         },
     )
 
@@ -433,13 +436,13 @@ def create_anthropic_copilot_client() -> AsyncAnthropic:
         auth_token=copilot_token,
         base_url=copilot_base_url(),
         default_headers={
-            "User-Agent": "GitHubCopilotChat/0.26.7",
-            "Editor-Version": "vscode/1.102.0",
-            "Editor-Plugin-Version": "copilot-chat/0.26.7",
-            "Copilot-Integration-Id": "vscode-chat",
+            "User-Agent": COPILOT_CHAT_USER_AGENT,
+            "Editor-Version": COPILOT_EDITOR_VERSION,
+            "Editor-Plugin-Version": COPILOT_CHAT_PLUGIN_VERSION,
+            "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
             "OpenAI-Intent": "conversation-panel",
-            "X-GitHub-Api-Version": "2025-04-01",
-            "X-Vscode-User-Agent-Library-Version": "electron-fetch",
+            "X-GitHub-Api-Version": COPILOT_GITHUB_API_VERSION,
+            "X-Vscode-User-Agent-Library-Version": COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
         },
     )
 
@@ -459,19 +462,28 @@ def copilot_base_url() -> str:
     )
 
 
+def copilot_token_exchange_headers(access_token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Editor-Version": COPILOT_EDITOR_VERSION,
+        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+        "Accept": "application/json",
+    }
+
+
 def copilot_api_headers(copilot_token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {copilot_token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "GitHubCopilotChat/0.26.7",
-        "Editor-Version": "vscode/1.102.0",
-        "Editor-Plugin-Version": "copilot-chat/0.26.7",
-        "Copilot-Integration-Id": "vscode-chat",
+        "User-Agent": COPILOT_CHAT_USER_AGENT,
+        "Editor-Version": COPILOT_EDITOR_VERSION,
+        "Editor-Plugin-Version": COPILOT_CHAT_PLUGIN_VERSION,
+        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
         "OpenAI-Intent": "conversation-panel",
-        "X-GitHub-Api-Version": "2025-04-01",
+        "X-GitHub-Api-Version": COPILOT_GITHUB_API_VERSION,
         "X-Request-Id": str(uuid.uuid4()),
-        "X-Vscode-User-Agent-Library-Version": "electron-fetch",
+        "X-Vscode-User-Agent-Library-Version": COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
     }
 
 
@@ -700,12 +712,7 @@ def poll_for_token(device_code: str, interval: int, expires_in: int) -> dict[str
 def exchange_for_copilot_token(access_token: str) -> dict[str, Any]:
     response = httpx.get(
         COPILOT_EXCHANGE_URL,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Editor-Version": "vscode/1.102.0",
-            "Copilot-Integration-Id": "vscode-chat",
-            "Accept": "application/json",
-        },
+        headers=copilot_token_exchange_headers(access_token),
         timeout=30,
     )
     response.raise_for_status()
@@ -1907,6 +1914,170 @@ def add_line_numbers(text: str, max_lines: int = 400, max_chars: int = 30000) ->
     return numbered
 
 
+@dataclass
+class SelfTestCase:
+    name: str
+    func: Callable[[], None]
+
+
+def _assert_equal(actual: Any, expected: Any, message: str = "") -> None:
+    if actual != expected:
+        detail = message or f"expected {expected!r}, got {actual!r}"
+        raise AssertionError(detail)
+
+
+def _assert_true(value: Any, message: str) -> None:
+    if not value:
+        raise AssertionError(message)
+
+
+def self_test_normalize_session_id() -> None:
+    _assert_equal(normalize_session_id("abc.json"), "abc")
+    _assert_equal(normalize_session_id(" 123 "), "123")
+    try:
+        normalize_session_id("a/b")
+    except ValueError:
+        return
+    raise AssertionError("normalize_session_id should reject paths")
+
+
+def self_test_parse_tool_call_arguments() -> None:
+    _assert_equal(parse_tool_call_arguments(None), {})
+    _assert_equal(parse_tool_call_arguments("{}"), {})
+    _assert_equal(parse_tool_call_arguments('{"x": 1}'), {"x": 1})
+    try:
+        parse_tool_call_arguments("[]")
+    except ValueError:
+        return
+    raise AssertionError("parse_tool_call_arguments should reject non-object JSON")
+
+
+def self_test_apply_patch_roundtrip() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        target = cwd / "demo.txt"
+        target.write_text("alpha\nbeta\n")
+        result = execute_apply_patch(
+            "\n".join(
+                [
+                    "*** Begin Patch",
+                    "*** Update File: demo.txt",
+                    "@@",
+                    " alpha",
+                    "-beta",
+                    "+gamma",
+                    "*** End Patch",
+                ]
+            ),
+            cwd,
+        )
+        _assert_true(result["success"], "apply_patch should succeed")
+        _assert_equal(target.read_text(), "alpha\ngamma\n")
+
+
+def self_test_validate_fetch_url() -> None:
+    validate_fetch_url("https://example.com/test")
+    validate_fetch_url("http://localhost:8080/test")
+    try:
+        validate_fetch_url("http://example.com/test")
+    except ValueError:
+        return
+    raise AssertionError("validate_fetch_url should reject external http URLs")
+
+
+def self_test_build_anthropic_messages() -> None:
+    system, messages = build_anthropic_messages(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "bash", "arguments": '{"command":"echo hi"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": '{"success": true}'},
+        ]
+    )
+    _assert_equal(system, "sys")
+    _assert_equal(messages[0], {"role": "user", "content": "hello"})
+    assistant_blocks = messages[1]["content"]
+    _assert_true(isinstance(assistant_blocks, list), "assistant content should be block list")
+    _assert_equal(assistant_blocks[1]["type"], "tool_use")
+    _assert_equal(messages[2]["content"][0]["type"], "tool_result")
+
+
+def self_test_copilot_headers() -> None:
+    exchange_headers = copilot_token_exchange_headers("token")
+    api_headers = copilot_api_headers("copilot")
+    _assert_equal(exchange_headers["Editor-Version"], COPILOT_EDITOR_VERSION)
+    _assert_equal(api_headers["Copilot-Integration-Id"], COPILOT_INTEGRATION_ID)
+    _assert_true("X-Request-Id" in api_headers, "api headers should include request id")
+
+
+SELF_TESTS: list[SelfTestCase] = [
+    SelfTestCase("normalize_session_id", self_test_normalize_session_id),
+    SelfTestCase("parse_tool_call_arguments", self_test_parse_tool_call_arguments),
+    SelfTestCase("apply_patch_roundtrip", self_test_apply_patch_roundtrip),
+    SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
+    SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
+    SelfTestCase("copilot_headers", self_test_copilot_headers),
+]
+
+
+def run_self_tests() -> None:
+    console = Console()
+    passed = 0
+    failed = 0
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Test")
+    table.add_column("Status")
+    table.add_column("Details")
+
+    for case in SELF_TESTS:
+        try:
+            case.func()
+        except Exception as exc:
+            failed += 1
+            table.add_row(case.name, "FAIL", str(exc))
+        else:
+            passed += 1
+            table.add_row(case.name, "PASS", "")
+
+    console.print(table)
+    if failed:
+        raise click.ClickException(f"self-test failed: {failed} of {passed + failed} tests failed")
+    console.print(f"[green]All self-tests passed ({passed}).[/green]")
+
+
+def _tool_error_from_json(exc: json.JSONDecodeError) -> dict[str, Any]:
+    return {"success": False, "error": f"invalid JSON arguments: {exc}"}
+
+
+def parse_tool_call_arguments(arguments: str | None) -> dict[str, Any]:
+    if not arguments:
+        return {}
+    parsed = json.loads(arguments)
+    if not isinstance(parsed, dict):
+        raise ValueError("tool arguments must decode to an object")
+    return parsed
+
+
+def tool_result_content(result: dict[str, Any]) -> str:
+    return json.dumps(result, ensure_ascii=False)
+
+
+@dataclass
+class AssistantTurn:
+    message: dict[str, Any]
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    responses_items: list[dict[str, Any]] = field(default_factory=list)
+
+
 class NanoAgent:
     def __init__(
         self,
@@ -1981,6 +2152,9 @@ class NanoAgent:
     def anthropic_thinking(self) -> dict[str, Any] | None:
         return anthropic_thinking_config(self.reasoning_effort)
 
+    def system_prompt(self) -> str:
+        return build_system_prompt(self.cwd)
+
     def close(self) -> None:
         self.save_history()
         self.bash.close()
@@ -2003,6 +2177,107 @@ class NanoAgent:
     def save_history(self) -> None:
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         self.history_path.write_text(json.dumps(self.serialized_history(), indent=2) + "\n")
+
+    async def execute_tool_calls(self, tool_calls: list[dict[str, Any]], *, call_id_key: str) -> list[dict[str, Any]]:
+        tool_outputs: list[dict[str, Any]] = []
+        for call in tool_calls:
+            try:
+                args = parse_tool_call_arguments(call["function"].get("arguments"))
+            except json.JSONDecodeError as exc:
+                result = _tool_error_from_json(exc)
+            except ValueError as exc:
+                result = {"success": False, "error": str(exc)}
+            else:
+                result = await self.run_tool(call["function"]["name"], args)
+
+            self.ui.show_tool_result(call["function"]["name"], result)
+            tool_content = tool_result_content(result)
+            tool_call_id = call[call_id_key]
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_content,
+                }
+            )
+            tool_outputs.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": tool_content,
+                }
+            )
+
+        return tool_outputs
+
+    def _finalize_response_turn(self, final_response: Any) -> AssistantTurn:
+        output_text = getattr(final_response, "output_text", None)
+        assistant_text = output_text if isinstance(output_text, str) and output_text else None
+        plain_response = _to_plain_data(final_response) or {}
+        output_items = plain_response.get("output") or []
+        responses_items = output_items if isinstance(output_items, list) else []
+        return AssistantTurn(
+            message={"role": "assistant", "content": assistant_text},
+            tool_calls=extract_function_calls_from_response(final_response),
+            responses_items=list(responses_items),
+        )
+
+    def _finalize_chat_turn(
+        self,
+        assistant_content_parts: list[str],
+        assistant_reasoning_parts: list[str],
+        tool_call_parts: dict[int, dict[str, Any]],
+        reasoning_opaque: str | None,
+    ) -> AssistantTurn:
+        message_tool_calls = _ordered_tool_calls(tool_call_parts)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(assistant_content_parts) or None,
+        }
+        if assistant_reasoning_parts:
+            assistant_message["reasoning_text"] = "".join(assistant_reasoning_parts)
+        if reasoning_opaque:
+            assistant_message["reasoning_opaque"] = reasoning_opaque
+        if message_tool_calls:
+            assistant_message["tool_calls"] = message_tool_calls
+        return AssistantTurn(message=assistant_message, tool_calls=message_tool_calls)
+
+    def _finalize_anthropic_turn(self, final_message: Any) -> AssistantTurn:
+        final_content = list(getattr(final_message, "content", []) or [])
+        assistant_text_parts: list[str] = []
+        assistant_thinking_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for item in final_content:
+            item_type = getattr(item, "type", None)
+            if item_type == "thinking":
+                thinking_text = cast(str | None, getattr(item, "thinking", None))
+                if thinking_text:
+                    assistant_thinking_parts.append(thinking_text)
+            elif item_type == "text":
+                text = cast(str | None, getattr(item, "text", None))
+                if text:
+                    assistant_text_parts.append(text)
+            elif item_type == "tool_use":
+                tool_calls.append(
+                    {
+                        "id": getattr(item, "id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(item, "name", ""),
+                            "arguments": json.dumps(getattr(item, "input", {}) or {}),
+                        },
+                    }
+                )
+
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(assistant_text_parts) or None,
+        }
+        if assistant_thinking_parts:
+            assistant_message["reasoning_text"] = "".join(assistant_thinking_parts)
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        return AssistantTurn(message=assistant_message, tool_calls=tool_calls)
 
     def current_skills(self) -> dict[str, SkillInfo]:
         return discover_skills(self.cwd)
@@ -2109,7 +2384,7 @@ class NanoAgent:
             kwargs: dict[str, Any] = {
                 "model": self.model,
                 "input": self.responses_items,
-                "instructions": build_system_prompt(self.cwd),
+                "instructions": self.system_prompt(),
                 "tools": chat_tools_to_responses_tools(chat_tools),
                 "tool_choice": "auto",
             }
@@ -2144,43 +2419,14 @@ class NanoAgent:
 
             self.ui.end_assistant()
 
-            output_text = getattr(final_response, "output_text", None)
-            assistant_text = output_text if isinstance(output_text, str) and output_text else None
-            self.messages.append({"role": "assistant", "content": assistant_text})
-            plain_response = _to_plain_data(final_response) or {}
-            output_items = plain_response.get("output") or []
-            if isinstance(output_items, list):
-                self.responses_items.extend(output_items)
+            turn = self._finalize_response_turn(final_response)
+            self.messages.append(turn.message)
+            self.responses_items.extend(turn.responses_items)
 
-            function_calls = extract_function_calls_from_response(final_response)
-            if not function_calls:
+            if not turn.tool_calls:
                 return
 
-            tool_outputs: list[dict[str, Any]] = []
-            for call in function_calls:
-                try:
-                    args = json.loads(call["function"].get("arguments") or "{}")
-                except json.JSONDecodeError as exc:
-                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
-                else:
-                    result = await self.run_tool(call["function"]["name"], args)
-                self.ui.show_tool_result(call["function"]["name"], result)
-                tool_content = json.dumps(result, ensure_ascii=False)
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["call_id"],
-                        "content": tool_content,
-                    }
-                )
-                tool_outputs.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call["call_id"],
-                        "output": tool_content,
-                    }
-                )
-
+            tool_outputs = await self.execute_tool_calls(turn.tool_calls, call_id_key="call_id")
             self.responses_items.extend(tool_outputs)
 
     async def send_via_chat_completions(self) -> None:
@@ -2192,7 +2438,7 @@ class NanoAgent:
             chat_messages = cast(
                 list[ChatCompletionMessageParam],
                 self.prepare_chat_messages(
-                    [{"role": "system", "content": build_system_prompt(self.cwd)}, *self.messages]
+                    [{"role": "system", "content": self.system_prompt()}, *self.messages]
                 ),
             )
             chat_tools = cast(list[ChatCompletionToolParam], self.tool_specs())
@@ -2249,38 +2495,19 @@ class NanoAgent:
 
             self.ui.end_assistant()
 
-            message_tool_calls = _ordered_tool_calls(tool_call_parts)
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": "".join(assistant_content_parts) or None,
-            }
-            if assistant_reasoning_parts:
-                assistant_message["reasoning_text"] = "".join(assistant_reasoning_parts)
-            if reasoning_opaque:
-                assistant_message["reasoning_opaque"] = reasoning_opaque
-            if message_tool_calls:
-                assistant_message["tool_calls"] = message_tool_calls
+            turn = self._finalize_chat_turn(
+                assistant_content_parts,
+                assistant_reasoning_parts,
+                tool_call_parts,
+                reasoning_opaque,
+            )
 
-            self.messages.append(assistant_message)
+            self.messages.append(turn.message)
 
-            if not message_tool_calls:
+            if not turn.tool_calls:
                 return
 
-            for call in message_tool_calls:
-                try:
-                    args = json.loads(call["function"].get("arguments") or "{}")
-                except json.JSONDecodeError as exc:
-                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
-                else:
-                    result = await self.run_tool(call["function"]["name"], args)
-                self.ui.show_tool_result(call["function"]["name"], result)
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
-                )
+            await self.execute_tool_calls(turn.tool_calls, call_id_key="id")
 
     async def send_via_anthropic_messages(self) -> None:
         if self.anthropic_client is None:
@@ -2291,7 +2518,7 @@ class NanoAgent:
             assistant_text_parts: list[str] = []
             assistant_thinking_parts: list[str] = []
 
-            system_prompt = build_system_prompt(self.cwd)
+            system_prompt = self.system_prompt()
             prepared_messages = self.prepare_chat_messages(
                 [{"role": "system", "content": system_prompt}, *self.messages]
             )
@@ -2328,30 +2555,6 @@ class NanoAgent:
 
                 final_message = await stream.get_final_message()
 
-            final_content = list(getattr(final_message, "content", []) or [])
-            tool_calls: list[dict[str, Any]] = []
-            for item in final_content:
-                item_type = getattr(item, "type", None)
-                if item_type == "thinking":
-                    thinking_text = cast(str | None, getattr(item, "thinking", None))
-                    if thinking_text and not assistant_thinking_parts:
-                        assistant_thinking_parts.append(thinking_text)
-                elif item_type == "text":
-                    text = cast(str | None, getattr(item, "text", None))
-                    if text and not assistant_text_parts:
-                        assistant_text_parts.append(text)
-                elif item_type == "tool_use":
-                    tool_calls.append(
-                        {
-                            "id": getattr(item, "id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": getattr(item, "name", ""),
-                                "arguments": json.dumps(getattr(item, "input", {}) or {}),
-                            },
-                        }
-                    )
-
             usage_value = getattr(final_message, "usage", None)
             if usage_value is not None:
                 self.record_usage(
@@ -2369,34 +2572,18 @@ class NanoAgent:
 
             self.ui.end_assistant()
 
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": "".join(assistant_text_parts) or None,
-            }
-            if assistant_thinking_parts:
-                assistant_message["reasoning_text"] = "".join(assistant_thinking_parts)
-            if tool_calls:
-                assistant_message["tool_calls"] = tool_calls
-            self.messages.append(assistant_message)
+            turn = self._finalize_anthropic_turn(final_message)
+            if assistant_thinking_parts and not turn.message.get("reasoning_text"):
+                turn.message["reasoning_text"] = "".join(assistant_thinking_parts)
+            if assistant_text_parts and not turn.message.get("content"):
+                turn.message["content"] = "".join(assistant_text_parts)
 
-            if not tool_calls:
+            self.messages.append(turn.message)
+
+            if not turn.tool_calls:
                 return
 
-            for call in tool_calls:
-                try:
-                    args = json.loads(call["function"].get("arguments") or "{}")
-                except json.JSONDecodeError as exc:
-                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
-                else:
-                    result = await self.run_tool(call["function"]["name"], args)
-                self.ui.show_tool_result(call["function"]["name"], result)
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
-                )
+            await self.execute_tool_calls(turn.tool_calls, call_id_key="id")
 
     async def run_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -2827,6 +3014,12 @@ def models_command(
         raise click.ClickException(f"Failed to list models: {exc}") from exc
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+@cast(Any, main).command(name="self-test")
+def self_test_command() -> None:
+    """Run built-in self-tests."""
+    run_self_tests()
 
 
 if __name__ == "__main__":
