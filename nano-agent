@@ -365,7 +365,8 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
     model = data.get("model")
     provider = data.get("provider")
     reasoning_effort = data.get("reasoning_effort")
-    history = data.get("history") if isinstance(data.get("history"), dict) else {}
+    raw_history = data.get("history")
+    history: dict[str, Any] = raw_history if isinstance(raw_history, dict) else {}
     messages = history.get("messages", data.get("messages", []))
     responses_items = history.get("responses_items", data.get("responses_items", []))
     usage = history.get("usage", data.get("usage", {}))
@@ -414,7 +415,8 @@ def list_conversation_histories() -> list[dict[str, Any]]:
         if not isinstance(data, dict):
             continue
 
-        history = data.get("history") if isinstance(data.get("history"), dict) else {}
+        raw_history = data.get("history")
+        history: dict[str, Any] = raw_history if isinstance(raw_history, dict) else {}
         messages = history.get("messages", data.get("messages", []))
         if not isinstance(messages, list):
             messages = []
@@ -653,8 +655,10 @@ def model_context_window_limit(model: str, provider: str = "copilot") -> int | N
 
 
 def model_supports_thinking(model: dict[str, Any]) -> str:
-    capabilities = model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
-    supports = capabilities.get("supports") if isinstance(capabilities.get("supports"), dict) else {}
+    raw_capabilities = model.get("capabilities")
+    capabilities: dict[str, Any] = raw_capabilities if isinstance(raw_capabilities, dict) else {}
+    raw_supports = capabilities.get("supports")
+    supports: dict[str, Any] = raw_supports if isinstance(raw_supports, dict) else {}
     reasoning_effort = supports.get("reasoning_effort")
     adaptive_thinking = supports.get("adaptive_thinking")
     min_budget = supports.get("min_thinking_budget")
@@ -704,9 +708,11 @@ def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
         vendor = model.get("vendor")
         version = model.get("version")
         preview = model.get("preview")
-        capabilities = model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
+        raw_capabilities = model.get("capabilities")
+        capabilities: dict[str, Any] = raw_capabilities if isinstance(raw_capabilities, dict) else {}
         model_type = capabilities.get("type")
-        limits = capabilities.get("limits") if isinstance(capabilities.get("limits"), dict) else {}
+        raw_limits = capabilities.get("limits")
+        limits: dict[str, Any] = raw_limits if isinstance(raw_limits, dict) else {}
         context_limit = limits.get("max_context_window_tokens")
         context_text = f"{int(context_limit):,}" if isinstance(context_limit, (int, float)) else ""
         thinking = model_supports_thinking(model)
@@ -1339,8 +1345,10 @@ def _extract_usage_metrics(value: Any) -> dict[str, int] | None:
         input_tokens = _coerce_usage_int(plain.get("input_tokens"))
         output_tokens = _coerce_usage_int(plain.get("output_tokens"))
         total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (input_tokens + output_tokens)
-        input_details = plain.get("input_tokens_details") if isinstance(plain.get("input_tokens_details"), dict) else {}
-        output_details = plain.get("output_tokens_details") if isinstance(plain.get("output_tokens_details"), dict) else {}
+        raw_input_details = plain.get("input_tokens_details")
+        input_details: dict[str, Any] = raw_input_details if isinstance(raw_input_details, dict) else {}
+        raw_output_details = plain.get("output_tokens_details")
+        output_details: dict[str, Any] = raw_output_details if isinstance(raw_output_details, dict) else {}
         return {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -1353,9 +1361,11 @@ def _extract_usage_metrics(value: Any) -> dict[str, int] | None:
         input_tokens = _coerce_usage_int(plain.get("prompt_tokens"))
         output_tokens = _coerce_usage_int(plain.get("completion_tokens"))
         total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (input_tokens + output_tokens)
-        prompt_details = plain.get("prompt_tokens_details") if isinstance(plain.get("prompt_tokens_details"), dict) else {}
-        completion_details = (
-            plain.get("completion_tokens_details") if isinstance(plain.get("completion_tokens_details"), dict) else {}
+        raw_prompt_details = plain.get("prompt_tokens_details")
+        prompt_details: dict[str, Any] = raw_prompt_details if isinstance(raw_prompt_details, dict) else {}
+        raw_completion_details = plain.get("completion_tokens_details")
+        completion_details: dict[str, Any] = (
+            raw_completion_details if isinstance(raw_completion_details, dict) else {}
         )
         return {
             "input_tokens": input_tokens,
@@ -1628,7 +1638,8 @@ def build_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | list
                 for call in tool_calls:
                     if not isinstance(call, dict):
                         continue
-                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    raw_function = call.get("function")
+                    function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
                     arguments = function.get("arguments")
                     try:
                         parsed_input = json.loads(arguments) if isinstance(arguments, str) and arguments else {}
@@ -1690,7 +1701,9 @@ class BashRunner:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "") + (exc.stderr or "")
+            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            output = stdout + stderr
             raise TimeoutError(f"command timed out after {timeout} seconds\n{output.rstrip()}") from exc
 
         return result.returncode, result.stdout.rstrip()
@@ -2958,6 +2971,8 @@ def run(
         if reasoning_source not in {None, ParameterSource.DEFAULT}
         else restored_reasoning_effort or cast(str, config["reasoning_effort"])
     )
+    if resolved_model is None or resolved_provider is None:
+        raise click.ClickException("model and provider must be resolved before running")
 
     try:
         asyncio.run(
