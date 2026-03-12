@@ -169,12 +169,97 @@ class ChatUI:
         self._current_stream = None
         self._stream_open = False
 
+    def _preview_text(self, text: str, *, max_lines: int = 18, max_chars: int = 4000) -> str:
+        lines = text.splitlines()
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            truncated = True
+        preview = "\n".join(lines)
+        if len(preview) > max_chars:
+            preview = preview[:max_chars].rstrip()
+            truncated = True
+        if truncated:
+            preview += "\n… [truncated]"
+        return preview
+
+    def _tool_metadata_rows(self, name: str, result: dict[str, Any]) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [("Tool", name)]
+        rows.append(("Status", "ok" if result.get("success") else "error"))
+
+        if not result.get("success"):
+            rows.append(("Error", str(result.get("error") or "unknown error")))
+            return rows
+
+        if name == "bash":
+            rows.append(("Command", str(result.get("command") or "")))
+            rows.append(("Exit code", str(result.get("exit_code") or 0)))
+            return rows
+
+        if name == "apply_patch":
+            rows.append(("Summary", str(result.get("summary") or "")))
+            changes = result.get("changes") if isinstance(result.get("changes"), list) else []
+            if changes:
+                rendered = []
+                for change in changes[:8]:
+                    if not isinstance(change, dict):
+                        continue
+                    action = str(change.get("action") or "update")
+                    path = str(change.get("move_to") or change.get("path") or "")
+                    rendered.append(f"{action} {path}".strip())
+                if rendered:
+                    rows.append(("Files", ", ".join(rendered)))
+            return rows
+
+        if name == "web_fetch":
+            rows.append(("URL", str(result.get("url") or "")))
+            if result.get("file_path"):
+                rows.append(("Saved", str(result.get("file_path"))))
+            if result.get("prompt"):
+                rows.append(("Extracted", "yes"))
+            return rows
+
+        if name == "skill":
+            rows.append(("Skill", str(result.get("skill_name") or "")))
+            rows.append(("Directory", str(result.get("directory") or "")))
+            return rows
+
+        return rows
+
+    def _tool_preview(self, name: str, result: dict[str, Any]) -> tuple[str, str] | None:
+        if not result.get("success"):
+            error = str(result.get("error") or "")
+            return ("Error", self._preview_text(error, max_lines=8, max_chars=1200)) if error else None
+
+        if name == "bash":
+            output = str(result.get("output") or "")
+            return ("Output", self._preview_text(output)) if output else None
+
+        if name == "apply_patch":
+            diff = str(result.get("diff") or "")
+            return ("Diff", self._preview_text(diff, max_lines=24, max_chars=5000)) if diff else None
+
+        if name in {"web_fetch", "skill"}:
+            content = str(result.get("content") or "")
+            return ("Preview", self._preview_text(content, max_lines=16, max_chars=3000)) if content else None
+
+        return None
+
     def show_tool_result(self, name: str, result: dict[str, Any]) -> None:
-        rendered = json.dumps(result, ensure_ascii=False)
         style = "green" if result.get("success") else "red"
         self._separator(f"tool:{name}", style)
-        self.console.print(f"tool:{name}: ", style=style, end="")
-        self.console.print(rendered, soft_wrap=True, markup=False)
+        table = Table(show_header=False, box=None, pad_edge=False)
+        table.add_column(style="bold")
+        table.add_column()
+        for label, value in self._tool_metadata_rows(name, result):
+            table.add_row(label, value)
+        self.console.print(table)
+
+        preview = self._tool_preview(name, result)
+        if preview:
+            title, content = preview
+            self.console.print(f"[bold]{title}[/bold]")
+            self.console.print(content, soft_wrap=True, markup=False)
 
     def newline(self) -> None:
         self.console.print()
