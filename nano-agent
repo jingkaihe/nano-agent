@@ -58,7 +58,7 @@ COPILOT_SCOPES = ["read:user", "user:email", "copilot"]
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "claude-sonnet-4.5")
 DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
-DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT")
+DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT", "medium")
 CONTEXT_FILENAME = "AGENTS.md"
 BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
@@ -1489,9 +1489,7 @@ def chat_tools_to_anthropic_tools(chat_tools: list[dict[str, Any]]) -> list[dict
 
 
 def anthropic_thinking_config(reasoning_effort: str | None) -> dict[str, Any] | None:
-    if reasoning_effort is None:
-        return {"type": "adaptive"}
-    if reasoning_effort == "none":
+    if not reasoning_effort or reasoning_effort == "none":
         return None
     normalized = reasoning_effort.strip().lower()
     if normalized in {"minimal", "low"}:
