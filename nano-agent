@@ -62,6 +62,7 @@ BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
 HISTORY_DIR = Path.home() / ".nano-agent" / "history"
 JINJA = Environment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
+COPILOT_MODELS_CACHE: list[dict[str, Any]] | None = None
 
 
 class CopilotAuthError(Exception):
@@ -172,7 +173,7 @@ class ChatUI:
         self.console.print(Rule(style="dim"))
         self.console.print(f"[dim]Session saved: {session_id}[/dim]")
 
-    def show_usage_summary(self, usage: SessionUsage, model: str) -> None:
+    def show_usage_summary(self, usage: SessionUsage, model: str, provider: str) -> None:
         if usage.request_count <= 0:
             return
 
@@ -197,7 +198,7 @@ class ChatUI:
             f"input {_format_int(usage.last_input_tokens)} (uncached {_format_int(uncached_last_input)}, cached {_format_int(usage.last_cached_input_tokens)}) / output {_format_int(usage.last_output_tokens)}",
         )
 
-        limit = _context_window_limit(usage.last_model or model)
+        limit = _context_window_limit(usage.last_model or model, provider=provider)
         label = "Last context"
         value = _format_ratio(usage.last_input_tokens, limit)
         if limit is None:
@@ -410,11 +411,7 @@ def refresh_copilot_token(creds: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 
 def create_openai_copilot_client() -> AsyncOpenAI:
-    base_url = (
-        "https://api.business.githubcopilot.com"
-        if os.getenv("BUSINESS_COPILOT") == "true"
-        else "https://api.githubcopilot.com"
-    )
+    base_url = copilot_base_url()
     creds = load_copilot_credentials()
     copilot_token, _ = refresh_copilot_token(creds)
     return AsyncOpenAI(
@@ -432,6 +429,189 @@ def create_direct_openai_client(api_key: str, base_url: str | None = None) -> As
     if base_url:
         kwargs["base_url"] = base_url
     return AsyncOpenAI(**kwargs)
+
+
+def copilot_base_url() -> str:
+    return (
+        "https://api.business.githubcopilot.com"
+        if os.getenv("BUSINESS_COPILOT") == "true"
+        else "https://api.githubcopilot.com"
+    )
+
+
+def copilot_api_headers(copilot_token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {copilot_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "GitHubCopilotChat/0.26.7",
+        "Editor-Version": "vscode/1.102.0",
+        "Editor-Plugin-Version": "copilot-chat/0.26.7",
+        "Copilot-Integration-Id": "vscode-chat",
+        "OpenAI-Intent": "conversation-panel",
+        "X-GitHub-Api-Version": "2025-04-01",
+        "X-Request-Id": str(uuid.uuid4()),
+        "X-Vscode-User-Agent-Library-Version": "electron-fetch",
+    }
+
+
+def resolve_openai_api_key(api_key: str | None) -> str:
+    resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
+    if not resolved_api_key:
+        raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY or pass --api-key.")
+    return resolved_api_key
+
+
+def resolve_openai_base_url(base_url: str | None) -> str | None:
+    return base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
+
+
+def list_provider_models(provider: str, api_key: str | None = None, base_url: str | None = None) -> list[dict[str, Any]]:
+    normalized = provider.strip().lower()
+
+    if normalized == "copilot":
+        global COPILOT_MODELS_CACHE
+        if api_key is None and base_url is None and COPILOT_MODELS_CACHE is not None:
+            return [dict(item) for item in COPILOT_MODELS_CACHE]
+        creds = load_copilot_credentials()
+        copilot_token, _ = refresh_copilot_token(creds)
+        response = httpx.get(
+            f"{copilot_base_url()}/models",
+            headers=copilot_api_headers(copilot_token),
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("Copilot models response is invalid")
+        models = [item for item in payload["data"] if isinstance(item, dict)]
+        if api_key is None and base_url is None:
+            COPILOT_MODELS_CACHE = [dict(item) for item in models]
+        return models
+
+    if normalized == "openai":
+        resolved_api_key = resolve_openai_api_key(api_key)
+        resolved_base_url = resolve_openai_base_url(base_url) or "https://api.openai.com/v1"
+        response = httpx.get(
+            f"{resolved_base_url.rstrip('/')}/models",
+            headers={
+                "Authorization": f"Bearer {resolved_api_key}",
+                "Accept": "application/json",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("OpenAI models response is invalid")
+        return [item for item in payload["data"] if isinstance(item, dict)]
+
+    raise ValueError(f"unsupported provider: {provider}")
+
+
+def _model_catalog_entry(model: str, provider: str = "copilot") -> dict[str, Any] | None:
+    normalized_model = model.strip().lower()
+    for item in list_provider_models(provider):
+        model_id = item.get("id")
+        version = item.get("version")
+        family = item.get("capabilities", {}).get("family") if isinstance(item.get("capabilities"), dict) else None
+        candidates = [model_id, version, family]
+        if any(isinstance(candidate, str) and candidate.strip().lower() == normalized_model for candidate in candidates):
+            return item
+    return None
+
+
+def model_context_window_limit(model: str, provider: str = "copilot") -> int | None:
+    try:
+        entry = _model_catalog_entry(model, provider=provider)
+    except Exception:
+        entry = None
+    limits = entry.get("capabilities", {}).get("limits") if isinstance(entry, dict) and isinstance(entry.get("capabilities"), dict) else {}
+    value = limits.get("max_context_window_tokens") if isinstance(limits, dict) else None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return _legacy_context_window_limit(model)
+
+
+def model_supports_thinking(model: dict[str, Any]) -> str:
+    capabilities = model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
+    supports = capabilities.get("supports") if isinstance(capabilities.get("supports"), dict) else {}
+    reasoning_effort = supports.get("reasoning_effort")
+    adaptive_thinking = supports.get("adaptive_thinking")
+    min_budget = supports.get("min_thinking_budget")
+    max_budget = supports.get("max_thinking_budget")
+
+    if isinstance(reasoning_effort, list) and reasoning_effort:
+        levels = "/".join(str(level) for level in reasoning_effort)
+        budget = ""
+        if isinstance(min_budget, (int, float)) and isinstance(max_budget, (int, float)):
+            budget = f" [{int(min_budget):,}-{int(max_budget):,}]"
+        mode = " adaptive" if adaptive_thinking is True else ""
+        return f"yes ({levels}){budget}{mode}"
+
+    if adaptive_thinking is True or isinstance(min_budget, (int, float)) or isinstance(max_budget, (int, float)):
+        budget = ""
+        if isinstance(min_budget, (int, float)) and isinstance(max_budget, (int, float)):
+            budget = f" [{int(min_budget):,}-{int(max_budget):,}]"
+        return f"yes{budget}"
+
+    return ""
+
+
+def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
+    console = Console()
+    if not models:
+        console.print("No models returned.")
+        return
+
+    normalized = provider.strip().lower()
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("ID", style="green")
+    table.add_column("Name")
+    table.add_column("Vendor")
+    table.add_column("Type")
+    table.add_column("Context")
+    table.add_column("Thinking")
+    table.add_column("Version")
+    table.add_column("Preview", style="dim")
+
+    def sort_key(item: dict[str, Any]) -> str:
+        model_id = item.get("id")
+        return model_id if isinstance(model_id, str) else ""
+
+    for model in sorted(models, key=sort_key):
+        model_id = model.get("id")
+        name = model.get("name")
+        vendor = model.get("vendor")
+        version = model.get("version")
+        preview = model.get("preview")
+        capabilities = model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
+        model_type = capabilities.get("type")
+        limits = capabilities.get("limits") if isinstance(capabilities.get("limits"), dict) else {}
+        context_limit = limits.get("max_context_window_tokens")
+        context_text = f"{int(context_limit):,}" if isinstance(context_limit, (int, float)) else ""
+        thinking = model_supports_thinking(model)
+
+        if normalized == "openai":
+            vendor = model.get("owned_by")
+            version = ""
+            preview = ""
+            model_type = model.get("object")
+
+        table.add_row(
+            model_id if isinstance(model_id, str) else "",
+            name if isinstance(name, str) else "",
+            vendor if isinstance(vendor, str) else "",
+            model_type if isinstance(model_type, str) else "",
+            context_text,
+            thinking,
+            version if isinstance(version, str) else "",
+            str(preview).lower() if isinstance(preview, bool) else "",
+        )
+
+    console.print(table)
 
 
 def create_client(provider: str, api_key: str | None = None, base_url: str | None = None) -> AsyncOpenAI:
@@ -1080,11 +1260,15 @@ def _format_int(value: int) -> str:
     return f"{value:,}"
 
 
-def _context_window_limit(model: str) -> int | None:
+def _legacy_context_window_limit(model: str) -> int | None:
     normalized = model.strip().lower()
     if "claude" in normalized or "anthropic" in normalized:
         return 200_000
     return None
+
+
+def _context_window_limit(model: str, provider: str = "copilot") -> int | None:
+    return model_context_window_limit(model, provider=provider)
 
 
 def _is_copilot_claude_chat(provider: str, model: str) -> bool:
@@ -2112,7 +2296,7 @@ async def run_chat(
                 break
             await agent.send(user_input)
     finally:
-        agent.ui.show_usage_summary(agent.usage, agent.model)
+        agent.ui.show_usage_summary(agent.usage, agent.model, agent.provider)
         agent.ui.show_session_exit(agent.session_id)
         agent.close()
 
@@ -2353,6 +2537,43 @@ def history_command() -> None:
         )
 
     console.print(table)
+
+
+@cast(Any, main).command(name="models")
+@click.option(
+    "--provider",
+    type=click.Choice(["copilot", "openai"], case_sensitive=False),
+    default=None,
+    help="LLM provider to query",
+)
+@click.option("--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode")
+@click.option("--base-url", default=None, help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.pass_context
+def models_command(
+    ctx: click.Context,
+    provider: str | None,
+    api_key: str | None,
+    base_url: str | None,
+) -> None:
+    """List available models."""
+    config = ctx.find_root().obj or {}
+    resolved_provider = provider or cast(str, config["provider"])
+    resolved_api_key = api_key if api_key is not None else cast(str | None, config["api_key"])
+    resolved_base_url = base_url if base_url is not None else cast(str | None, config["base_url"])
+
+    try:
+        models = list_provider_models(
+            provider=resolved_provider,
+            api_key=resolved_api_key,
+            base_url=resolved_base_url,
+        )
+        render_models_table(models, provider=resolved_provider)
+    except CopilotAuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise click.ClickException(f"Failed to list models: {exc}") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 if __name__ == "__main__":
