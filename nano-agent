@@ -4,6 +4,7 @@
 # dependencies = [
 #   "click>=8.1.8",
 #   "openai>=1.68.2",
+#   "anthropic>=0.82.0",
 #   "httpx>=0.28.1",
 #   "prompt_toolkit>=3.0.47",
 #   "PyYAML>=6.0.2",
@@ -34,6 +35,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 import yaml
 import click
+from anthropic import AsyncAnthropic
 from click.core import ParameterSource
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
@@ -56,7 +58,7 @@ COPILOT_SCOPES = ["read:user", "user:email", "copilot"]
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "claude-sonnet-4.5")
 DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
-DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT", "high")
+DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT")
 CONTEXT_FILENAME = "AGENTS.md"
 BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
@@ -420,6 +422,24 @@ def create_openai_copilot_client() -> AsyncOpenAI:
         default_headers={
             "User-Agent": "GithubCopilot/1.342.0",
             "Editor-Version": "vscode/1.102.0",
+        },
+    )
+
+
+def create_anthropic_copilot_client() -> AsyncAnthropic:
+    creds = load_copilot_credentials()
+    copilot_token, _ = refresh_copilot_token(creds)
+    return AsyncAnthropic(
+        auth_token=copilot_token,
+        base_url=copilot_base_url(),
+        default_headers={
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.102.0",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            "Copilot-Integration-Id": "vscode-chat",
+            "OpenAI-Intent": "conversation-panel",
+            "X-GitHub-Api-Version": "2025-04-01",
+            "X-Vscode-User-Agent-Library-Version": "electron-fetch",
         },
     )
 
@@ -1355,6 +1375,10 @@ def _is_anthropic_like_model(model: str) -> bool:
     return "anthropic" in normalized or "claude" in normalized
 
 
+def should_use_anthropic_messages_api(provider: str, model: str) -> bool:
+    return _is_copilot_provider(provider) and _is_anthropic_like_model(model)
+
+
 def apply_copilot_ephemeral_cache(
     messages: list[dict[str, Any]],
     *,
@@ -1446,6 +1470,113 @@ def chat_tools_to_responses_tools(chat_tools: list[dict[str, Any]]) -> list[dict
             }
         )
     return tools
+
+
+def chat_tools_to_anthropic_tools(chat_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for tool in chat_tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            continue
+        tools.append(
+            {
+                "name": function.get("name") or "",
+                "description": function.get("description") or "",
+                "input_schema": function.get("parameters") or {},
+            }
+        )
+    return tools
+
+
+def anthropic_thinking_config(reasoning_effort: str | None) -> dict[str, Any] | None:
+    if reasoning_effort is None:
+        return {"type": "adaptive"}
+    if reasoning_effort == "none":
+        return None
+    normalized = reasoning_effort.strip().lower()
+    if normalized in {"minimal", "low"}:
+        return {"type": "enabled", "budget_tokens": 2048}
+    if normalized == "medium":
+        return {"type": "enabled", "budget_tokens": 4096}
+    if normalized == "high":
+        return {"type": "enabled", "budget_tokens": 8192}
+    return {"type": "adaptive"}
+
+
+def build_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    system_blocks: list[dict[str, Any]] = []
+    anthropic_messages: list[dict[str, Any]] = []
+
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                system_blocks.append({"type": "text", "text": content})
+            continue
+
+        if role == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                anthropic_messages.append({"role": "user", "content": content})
+            elif isinstance(content, list):
+                anthropic_messages.append({"role": "user", "content": content})
+            continue
+
+        if role == "assistant":
+            blocks: list[dict[str, Any]] = []
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        blocks.append(item)
+
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    arguments = function.get("arguments")
+                    try:
+                        parsed_input = json.loads(arguments) if isinstance(arguments, str) and arguments else {}
+                    except json.JSONDecodeError:
+                        parsed_input = {}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call.get("id") or str(uuid.uuid4()),
+                            "name": function.get("name") or "",
+                            "input": parsed_input if isinstance(parsed_input, dict) else {},
+                        }
+                    )
+
+            anthropic_messages.append({"role": "assistant", "content": blocks or ""})
+            continue
+
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            content = message.get("content")
+            anthropic_messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id or "",
+                            "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
+                        }
+                    ],
+                }
+            )
+
+    if not system_blocks:
+        return None, anthropic_messages
+    if len(system_blocks) == 1:
+        return system_blocks[0]["text"], anthropic_messages
+    return system_blocks, anthropic_messages
 
 
 class BashRunner:
@@ -1806,6 +1937,9 @@ class NanoAgent:
             except Exception:
                 pass
         self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
+        self.anthropic_client = (
+            create_anthropic_copilot_client() if should_use_anthropic_messages_api(provider, model) else None
+        )
         self.messages: list[dict[str, Any]] = list(messages or [])
         self.responses_items: list[dict[str, Any]] = list(responses_items or [])
         self.usage = SessionUsage.from_dict(usage)
@@ -1845,6 +1979,9 @@ class NanoAgent:
         if not self.reasoning_effort:
             return None
         return {"effort": self.reasoning_effort, "summary": "auto"}
+
+    def anthropic_thinking(self) -> dict[str, Any] | None:
+        return anthropic_thinking_config(self.reasoning_effort)
 
     def close(self) -> None:
         self.save_history()
@@ -2147,6 +2284,122 @@ class NanoAgent:
                     }
                 )
 
+    async def send_via_anthropic_messages(self) -> None:
+        if self.anthropic_client is None:
+            raise ValueError("Anthropic messages client is not configured")
+
+        while True:
+            self.ui.begin_assistant()
+            assistant_text_parts: list[str] = []
+            assistant_thinking_parts: list[str] = []
+
+            system_prompt = build_system_prompt(self.cwd)
+            prepared_messages = self.prepare_chat_messages(
+                [{"role": "system", "content": system_prompt}, *self.messages]
+            )
+            system, anthropic_messages = build_anthropic_messages(prepared_messages)
+
+            kwargs: dict[str, Any] = {
+                "model": self.model,
+                "max_tokens": 16384,
+                "messages": anthropic_messages,
+                "tools": chat_tools_to_anthropic_tools(self.tool_specs()),
+            }
+            if system is not None:
+                kwargs["system"] = system
+            thinking = self.anthropic_thinking()
+            if thinking is not None:
+                kwargs["thinking"] = thinking
+
+            async with self.anthropic_client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    event_type = getattr(event, "type", None)
+                    if event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        delta_type = getattr(delta, "type", None)
+                        if delta_type == "thinking_delta":
+                            fragment = cast(str, getattr(delta, "thinking", ""))
+                            if fragment:
+                                assistant_thinking_parts.append(fragment)
+                                self.ui.update_assistant(reasoning_fragment=fragment)
+                        elif delta_type == "text_delta":
+                            fragment = cast(str, getattr(delta, "text", ""))
+                            if fragment:
+                                assistant_text_parts.append(fragment)
+                                self.ui.update_assistant(text_fragment=fragment)
+
+                final_message = await stream.get_final_message()
+
+            final_content = list(getattr(final_message, "content", []) or [])
+            tool_calls: list[dict[str, Any]] = []
+            for item in final_content:
+                item_type = getattr(item, "type", None)
+                if item_type == "thinking":
+                    thinking_text = cast(str | None, getattr(item, "thinking", None))
+                    if thinking_text and not assistant_thinking_parts:
+                        assistant_thinking_parts.append(thinking_text)
+                elif item_type == "text":
+                    text = cast(str | None, getattr(item, "text", None))
+                    if text and not assistant_text_parts:
+                        assistant_text_parts.append(text)
+                elif item_type == "tool_use":
+                    tool_calls.append(
+                        {
+                            "id": getattr(item, "id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(item, "name", ""),
+                                "arguments": json.dumps(getattr(item, "input", {}) or {}),
+                            },
+                        }
+                    )
+
+            usage_value = getattr(final_message, "usage", None)
+            if usage_value is not None:
+                self.record_usage(
+                    {
+                        "input_tokens": _coerce_usage_int(getattr(usage_value, "input_tokens", 0)),
+                        "output_tokens": _coerce_usage_int(getattr(usage_value, "output_tokens", 0)),
+                        "total_tokens": _coerce_usage_int(getattr(usage_value, "input_tokens", 0))
+                        + _coerce_usage_int(getattr(usage_value, "output_tokens", 0)),
+                        "cached_input_tokens": _coerce_usage_int(getattr(usage_value, "cache_read_input_tokens", 0)),
+                        "reasoning_tokens": 0,
+                    },
+                    api="messages",
+                    model=getattr(final_message, "model", None) or self.model,
+                )
+
+            self.ui.end_assistant()
+
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": "".join(assistant_text_parts) or None,
+            }
+            if assistant_thinking_parts:
+                assistant_message["reasoning_text"] = "".join(assistant_thinking_parts)
+            if tool_calls:
+                assistant_message["tool_calls"] = tool_calls
+            self.messages.append(assistant_message)
+
+            if not tool_calls:
+                return
+
+            for call in tool_calls:
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError as exc:
+                    result = {"success": False, "error": f"invalid JSON arguments: {exc}"}
+                else:
+                    result = await self.run_tool(call["function"]["name"], args)
+                self.ui.show_tool_result(call["function"]["name"], result)
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+
     async def run_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
             if name == "bash":
@@ -2237,7 +2490,9 @@ The skill directory is located at: {skill.directory}
     async def send(self, user_input: str) -> None:
         self.ui.show_user(user_input)
         self.messages.append({"role": "user", "content": user_input})
-        if should_use_responses_api(self.model):
+        if should_use_anthropic_messages_api(self.provider, self.model):
+            await self.send_via_anthropic_messages()
+        elif should_use_responses_api(self.model):
             self.responses_items.append(
                 {
                     "role": "user",
