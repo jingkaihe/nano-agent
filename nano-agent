@@ -69,6 +69,7 @@ DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
 DEFAULT_REASONING_EFFORT = os.getenv("NANO_AGENT_REASONING_EFFORT", "medium")
 CONTEXT_FILENAME = "AGENTS.md"
 BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
+MAX_TOOL_OUTPUT_BYTES = 32 * 1024
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
 HISTORY_DIR = Path.home() / ".nano-agent" / "history"
 JINJA = Environment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
@@ -194,6 +195,8 @@ class ChatUI:
         if name == "bash":
             rows.append(("Command", str(result.get("command") or "")))
             rows.append(("Exit code", str(result.get("exit_code") or 0)))
+            if result.get("truncated"):
+                rows.append(("Output", f"truncated to {MAX_TOOL_OUTPUT_BYTES} bytes"))
             return rows
 
         if name == "apply_patch":
@@ -1687,7 +1690,7 @@ class BashRunner:
     def close(self) -> None:
         return
 
-    def run(self, command: str, timeout: int) -> tuple[int, str]:
+    def run(self, command: str, timeout: int) -> tuple[int, str, bool]:
         try:
             result = subprocess.run(
                 command,
@@ -1703,10 +1706,11 @@ class BashRunner:
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-            output = stdout + stderr
-            raise TimeoutError(f"command timed out after {timeout} seconds\n{output.rstrip()}") from exc
+            output, _truncated = truncate_tool_output((stdout + stderr).rstrip())
+            raise TimeoutError(f"command timed out after {timeout} seconds\n{output}") from exc
 
-        return result.returncode, result.stdout.rstrip()
+        output, truncated = truncate_tool_output(result.stdout.rstrip())
+        return result.returncode, output, truncated
 
 
 def validate_bash_args(command: Any, description: Any, timeout: Any) -> tuple[str, str, int]:
@@ -2012,6 +2016,21 @@ def add_line_numbers(text: str, max_lines: int = 400, max_chars: int = 30000) ->
     return numbered
 
 
+def truncate_tool_output(text: str, max_bytes: int = MAX_TOOL_OUTPUT_BYTES) -> tuple[str, bool]:
+    output_bytes = text.encode("utf-8")
+    if len(output_bytes) <= max_bytes:
+        return text, False
+
+    suffix = f"\n... [truncated due to max output bytes limit of {max_bytes}]"
+    suffix_bytes = suffix.encode("utf-8")
+    if len(suffix_bytes) >= max_bytes:
+        return suffix, True
+
+    truncated_bytes = output_bytes[: max_bytes - len(suffix_bytes)]
+    truncated_text = truncated_bytes.decode("utf-8", errors="ignore").rstrip()
+    return f"{truncated_text}{suffix}", True
+
+
 @dataclass
 class SelfTestCase:
     name: str
@@ -2117,6 +2136,24 @@ def self_test_copilot_headers() -> None:
     _assert_true("X-Request-Id" in api_headers, "api headers should include request id")
 
 
+def self_test_truncate_tool_output() -> None:
+    passthrough, passthrough_truncated = truncate_tool_output("hello world")
+    _assert_equal(passthrough, "hello world")
+    _assert_true(not passthrough_truncated, "short output should not be truncated")
+
+    large_output = "a" * (MAX_TOOL_OUTPUT_BYTES + 256)
+    truncated_output, was_truncated = truncate_tool_output(large_output)
+    _assert_true(was_truncated, "large output should be truncated")
+    _assert_true(
+        len(truncated_output.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES,
+        "truncated output should respect the byte limit",
+    )
+    _assert_true(
+        truncated_output.endswith(f"... [truncated due to max output bytes limit of {MAX_TOOL_OUTPUT_BYTES}]"),
+        "truncated output should include a clear truncation marker",
+    )
+
+
 SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("normalize_session_id", self_test_normalize_session_id),
     SelfTestCase("parse_tool_call_arguments", self_test_parse_tool_call_arguments),
@@ -2124,6 +2161,7 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
     SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
     SelfTestCase("copilot_headers", self_test_copilot_headers),
+    SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
 ]
 
 
@@ -2691,12 +2729,13 @@ class NanoAgent:
                     arguments.get("description"),
                     arguments.get("timeout"),
                 )
-                exit_code, output = self.bash.run(command, timeout)
+                exit_code, output, truncated = self.bash.run(command, timeout)
                 return {
                     "success": exit_code == 0,
                     "command": command,
                     "exit_code": exit_code,
                     "output": output,
+                    "truncated": truncated,
                 }
 
             if name == "apply_patch":
