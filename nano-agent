@@ -33,9 +33,9 @@ from pathlib import Path
 from typing import Any, Callable, cast
 from urllib.parse import urljoin, urlparse
 
+import click
 import httpx
 import yaml
-import click
 from anthropic import AsyncAnthropic
 from click.core import ParameterSource
 from jinja2 import Environment, StrictUndefined
@@ -49,7 +49,6 @@ from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.rule import Rule
 from rich.table import Table
-
 
 COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 COPILOT_DEVICE_URL = "https://github.com/login/device/code"
@@ -125,17 +124,23 @@ class ChatUI:
         subtitle = f"{provider} / {model}"
         if reasoning_effort:
             subtitle += f" / reasoning={reasoning_effort}"
-        self.console.print(Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{subtitle}[/dim]"))
+        self.console.print(
+            Rule(f"[bold cyan]nano-agent[/bold cyan] [dim]{subtitle}[/dim]")
+        )
         prefix = "Resumed session" if resumed else "Session"
         self.console.print(f"[dim]{prefix}: {session_id}[/dim]")
         self.console.print("[dim]Type /exit to quit.[/dim]")
-        self.console.print("[dim]Press Enter to submit. Press Ctrl+X Ctrl+E to edit in $EDITOR. Ctrl+D exits on empty input.[/dim]")
+        self.console.print(
+            "[dim]Press Enter to submit. Press Ctrl+X Ctrl+E to edit in $EDITOR. Ctrl+D exits on empty input.[/dim]"
+        )
 
     async def prompt(self) -> str:
         self.console.print()
-        return (await self._prompt_session.prompt_async(
-            HTML("<b><ansigreen>You</ansigreen></b> > "),
-        )).strip()
+        return (
+            await self._prompt_session.prompt_async(
+                HTML("<b><ansigreen>You</ansigreen></b> > "),
+            )
+        ).strip()
 
     def show_user(self, text: str) -> None:
         self._separator("user", "green")
@@ -145,7 +150,9 @@ class ChatUI:
         self._current_stream = None
         self._stream_open = False
 
-    def update_assistant(self, text_fragment: str = "", reasoning_fragment: str = "") -> None:
+    def update_assistant(
+        self, text_fragment: str = "", reasoning_fragment: str = ""
+    ) -> None:
         if reasoning_fragment:
             if self._current_stream != "thinking":
                 if self._stream_open:
@@ -154,7 +161,13 @@ class ChatUI:
                 self.console.print("thinking: ", style="magenta", end="")
                 self._current_stream = "thinking"
                 self._stream_open = True
-            self.console.print(reasoning_fragment, style="dim italic", end="", soft_wrap=True, markup=False)
+            self.console.print(
+                reasoning_fragment,
+                style="dim italic",
+                end="",
+                soft_wrap=True,
+                markup=False,
+            )
 
         if text_fragment:
             if self._current_stream != "assistant":
@@ -172,7 +185,9 @@ class ChatUI:
         self._current_stream = None
         self._stream_open = False
 
-    def _preview_text(self, text: str, *, max_lines: int = 18, max_chars: int = 4000) -> str:
+    def _preview_text(
+        self, text: str, *, max_lines: int = 18, max_chars: int = 4000
+    ) -> str:
         lines = text.splitlines()
         truncated = False
         if len(lines) > max_lines:
@@ -186,7 +201,9 @@ class ChatUI:
             preview += "\n… [truncated]"
         return preview
 
-    def _tool_metadata_rows(self, name: str, result: dict[str, Any]) -> list[tuple[str, str]]:
+    def _tool_metadata_rows(
+        self, name: str, result: dict[str, Any]
+    ) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = [("Tool", name)]
         rows.append(("Status", "ok" if result.get("success") else "error"))
 
@@ -203,7 +220,9 @@ class ChatUI:
 
         if name == "apply_patch":
             rows.append(("Summary", str(result.get("summary") or "")))
-            changes = result.get("changes") if isinstance(result.get("changes"), list) else []
+            changes = (
+                result.get("changes") if isinstance(result.get("changes"), list) else []
+            )
             if changes:
                 rendered = []
                 for change in changes[:8]:
@@ -231,10 +250,16 @@ class ChatUI:
 
         return rows
 
-    def _tool_preview(self, name: str, result: dict[str, Any]) -> tuple[str, str] | None:
+    def _tool_preview(
+        self, name: str, result: dict[str, Any]
+    ) -> tuple[str, str] | None:
         if not result.get("success"):
             error = str(result.get("error") or "")
-            return ("Error", self._preview_text(error, max_lines=8, max_chars=1200)) if error else None
+            return (
+                ("Error", self._preview_text(error, max_lines=8, max_chars=1200))
+                if error
+                else None
+            )
 
         if name == "bash":
             output = str(result.get("output") or "")
@@ -242,11 +267,19 @@ class ChatUI:
 
         if name == "apply_patch":
             diff = str(result.get("diff") or "")
-            return ("Diff", self._preview_text(diff, max_lines=24, max_chars=5000)) if diff else None
+            return (
+                ("Diff", self._preview_text(diff, max_lines=24, max_chars=5000))
+                if diff
+                else None
+            )
 
         if name in {"web_fetch", "skill"}:
             content = str(result.get("content") or "")
-            return ("Preview", self._preview_text(content, max_lines=16, max_chars=3000)) if content else None
+            return (
+                ("Preview", self._preview_text(content, max_lines=16, max_chars=3000))
+                if content
+                else None
+            )
 
         return None
 
@@ -273,7 +306,9 @@ class ChatUI:
         self.console.print(Rule(style="dim"))
         self.console.print(f"[dim]Session saved: {session_id}[/dim]")
 
-    def show_usage_summary(self, usage: SessionUsage, model: str, provider: str) -> None:
+    def show_usage_summary(
+        self, usage: SessionUsage, model: str, provider: str
+    ) -> None:
         if usage.request_count <= 0:
             return
 
@@ -292,7 +327,9 @@ class ChatUI:
             f"read {_format_int(usage.cached_input_tokens)} / reasoning {_format_int(usage.reasoning_tokens)}",
         )
 
-        uncached_last_input = max(usage.last_input_tokens - usage.last_cached_input_tokens, 0)
+        uncached_last_input = max(
+            usage.last_input_tokens - usage.last_cached_input_tokens, 0
+        )
         table.add_row(
             "Last request",
             f"input {_format_int(usage.last_input_tokens)} (uncached {_format_int(uncached_last_input)}, cached {_format_int(usage.last_cached_input_tokens)}) / output {_format_int(usage.last_output_tokens)}",
@@ -399,12 +436,22 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
     if not isinstance(usage, dict):
         usage = {}
     if not isinstance(created_at, str) or not created_at.strip():
-        created_at = datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        created_at = (
+            datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
     if not isinstance(updated_at, str) or not updated_at.strip():
-        updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        updated_at = (
+            datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
 
     return {
-        "id": normalize_session_id(stored_id) if isinstance(stored_id, str) and stored_id.strip() else normalized,
+        "id": normalize_session_id(stored_id)
+        if isinstance(stored_id, str) and stored_id.strip()
+        else normalized,
         "model": model,
         "provider": provider,
         "reasoning_effort": reasoning_effort,
@@ -439,11 +486,19 @@ def list_conversation_histories() -> list[dict[str, Any]]:
 
         created_at = data.get("created_at")
         if not isinstance(created_at, str) or not created_at.strip():
-            created_at = datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            created_at = (
+                datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
 
         updated_at = data.get("updated_at")
         if not isinstance(updated_at, str) or not updated_at.strip():
-            updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            updated_at = (
+                datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
 
         sessions.append(
             {
@@ -544,7 +599,9 @@ def save_cached_provider_models(
     return _coerce_expires_at(timestamp) + MODELS_CACHE_TTL_SECONDS
 
 
-def _set_copilot_models_cache(models: list[dict[str, Any]], *, expires_at: float | None) -> None:
+def _set_copilot_models_cache(
+    models: list[dict[str, Any]], *, expires_at: float | None
+) -> None:
     global COPILOT_MODELS_CACHE
     global COPILOT_MODELS_CACHE_EXPIRES_AT
     COPILOT_MODELS_CACHE = [dict(item) for item in models]
@@ -560,7 +617,9 @@ def load_copilot_credentials() -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def save_copilot_credentials(credentials: dict[str, Any], output_path: Path | None = None) -> Path:
+def save_copilot_credentials(
+    credentials: dict[str, Any], output_path: Path | None = None
+) -> Path:
     path = output_path or credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(credentials, indent=2) + "\n")
@@ -622,7 +681,9 @@ def create_anthropic_copilot_client() -> AsyncAnthropic:
     )
 
 
-def create_direct_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpenAI:
+def create_direct_openai_client(
+    api_key: str, base_url: str | None = None
+) -> AsyncOpenAI:
     kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
@@ -663,9 +724,13 @@ def copilot_api_headers(copilot_token: str) -> dict[str, str]:
 
 
 def resolve_openai_api_key(api_key: str | None) -> str:
-    resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
+    resolved_api_key = (
+        api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
+    )
     if not resolved_api_key:
-        raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY or pass --api-key.")
+        raise ValueError(
+            "OpenAI API key not found. Set OPENAI_API_KEY or pass --api-key."
+        )
     return resolved_api_key
 
 
@@ -718,7 +783,9 @@ def list_provider_models(
 
     if normalized == "openai":
         resolved_api_key = resolve_openai_api_key(api_key)
-        resolved_base_url = resolve_openai_base_url(base_url) or "https://api.openai.com/v1"
+        resolved_base_url = (
+            resolve_openai_base_url(base_url) or "https://api.openai.com/v1"
+        )
         response = httpx.get(
             f"{resolved_base_url.rstrip('/')}/models",
             headers={
@@ -736,24 +803,39 @@ def list_provider_models(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-def _model_catalog_entry(model: str, provider: str = "copilot") -> dict[str, Any] | None:
+def _model_catalog_entry(
+    model: str, provider: str = "copilot"
+) -> dict[str, Any] | None:
     normalized_model = model.strip().lower()
     for item in list_provider_models(provider):
         model_id = item.get("id")
         version = item.get("version")
-        family = item.get("capabilities", {}).get("family") if isinstance(item.get("capabilities"), dict) else None
+        family = (
+            item.get("capabilities", {}).get("family")
+            if isinstance(item.get("capabilities"), dict)
+            else None
+        )
         candidates = [model_id, version, family]
-        if any(isinstance(candidate, str) and candidate.strip().lower() == normalized_model for candidate in candidates):
+        if any(
+            isinstance(candidate, str) and candidate.strip().lower() == normalized_model
+            for candidate in candidates
+        ):
             return item
     return None
 
 
-def model_supports_endpoint(endpoint: str, model: str, provider: str = "copilot") -> bool:
+def model_supports_endpoint(
+    endpoint: str, model: str, provider: str = "copilot"
+) -> bool:
     try:
         entry = _model_catalog_entry(model, provider=provider)
     except Exception:
         return False
-    supported_endpoints = entry.get("supported_endpoints") if isinstance(entry, dict) else None
+    supported_endpoints = (
+        entry.get("supported_endpoints") if isinstance(entry, dict) else None
+    )
+    if supported_endpoints is None:
+        return True
     if not isinstance(supported_endpoints, list):
         return False
     if not supported_endpoints:
@@ -770,8 +852,14 @@ def model_context_window_limit(model: str, provider: str = "copilot") -> int | N
         entry = _model_catalog_entry(model, provider=provider)
     except Exception:
         entry = None
-    limits = entry.get("capabilities", {}).get("limits") if isinstance(entry, dict) and isinstance(entry.get("capabilities"), dict) else {}
-    value = limits.get("max_context_window_tokens") if isinstance(limits, dict) else None
+    limits = (
+        entry.get("capabilities", {}).get("limits")
+        if isinstance(entry, dict) and isinstance(entry.get("capabilities"), dict)
+        else {}
+    )
+    value = (
+        limits.get("max_context_window_tokens") if isinstance(limits, dict) else None
+    )
     if isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -781,7 +869,9 @@ def model_context_window_limit(model: str, provider: str = "copilot") -> int | N
 
 def model_supports_thinking(model: dict[str, Any]) -> str:
     raw_capabilities = model.get("capabilities")
-    capabilities: dict[str, Any] = raw_capabilities if isinstance(raw_capabilities, dict) else {}
+    capabilities: dict[str, Any] = (
+        raw_capabilities if isinstance(raw_capabilities, dict) else {}
+    )
     raw_supports = capabilities.get("supports")
     supports: dict[str, Any] = raw_supports if isinstance(raw_supports, dict) else {}
     reasoning_effort = supports.get("reasoning_effort")
@@ -792,14 +882,22 @@ def model_supports_thinking(model: dict[str, Any]) -> str:
     if isinstance(reasoning_effort, list) and reasoning_effort:
         levels = "/".join(str(level) for level in reasoning_effort)
         budget = ""
-        if isinstance(min_budget, (int, float)) and isinstance(max_budget, (int, float)):
+        if isinstance(min_budget, (int, float)) and isinstance(
+            max_budget, (int, float)
+        ):
             budget = f" [{int(min_budget):,}-{int(max_budget):,}]"
         mode = " adaptive" if adaptive_thinking is True else ""
         return f"yes ({levels}){budget}{mode}"
 
-    if adaptive_thinking is True or isinstance(min_budget, (int, float)) or isinstance(max_budget, (int, float)):
+    if (
+        adaptive_thinking is True
+        or isinstance(min_budget, (int, float))
+        or isinstance(max_budget, (int, float))
+    ):
         budget = ""
-        if isinstance(min_budget, (int, float)) and isinstance(max_budget, (int, float)):
+        if isinstance(min_budget, (int, float)) and isinstance(
+            max_budget, (int, float)
+        ):
             budget = f" [{int(min_budget):,}-{int(max_budget):,}]"
         return f"yes{budget}"
 
@@ -834,12 +932,16 @@ def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
         version = model.get("version")
         preview = model.get("preview")
         raw_capabilities = model.get("capabilities")
-        capabilities: dict[str, Any] = raw_capabilities if isinstance(raw_capabilities, dict) else {}
+        capabilities: dict[str, Any] = (
+            raw_capabilities if isinstance(raw_capabilities, dict) else {}
+        )
         model_type = capabilities.get("type")
         raw_limits = capabilities.get("limits")
         limits: dict[str, Any] = raw_limits if isinstance(raw_limits, dict) else {}
         context_limit = limits.get("max_context_window_tokens")
-        context_text = f"{int(context_limit):,}" if isinstance(context_limit, (int, float)) else ""
+        context_text = (
+            f"{int(context_limit):,}" if isinstance(context_limit, (int, float)) else ""
+        )
         thinking = model_supports_thinking(model)
 
         if normalized == "openai":
@@ -862,17 +964,23 @@ def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
     console.print(table)
 
 
-def create_client(provider: str, api_key: str | None = None, base_url: str | None = None) -> AsyncOpenAI:
+def create_client(
+    provider: str, api_key: str | None = None, base_url: str | None = None
+) -> AsyncOpenAI:
     normalized = provider.strip().lower()
     if normalized == "copilot":
         return create_openai_copilot_client()
     if normalized == "openai":
-        resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
+        resolved_api_key = (
+            api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
+        )
         if not resolved_api_key:
             raise ValueError(
                 "OpenAI API key not found. Set OPENAI_API_KEY or pass --api-key."
             )
-        resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
+        resolved_base_url = (
+            base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
+        )
         return create_direct_openai_client(resolved_api_key, resolved_base_url)
     raise ValueError(f"unsupported provider: {provider}")
 
@@ -1003,7 +1111,7 @@ def collect_contexts(cwd: Path) -> list[tuple[Path, str]]:
 def build_system_prompt(cwd: Path) -> str:
     contexts = collect_contexts(cwd)
     template = JINJA.from_string(
-        '''You are an interactive CLI tool that helps with software engineering and production operations tasks. Please follows the instructions and tools below to help the user.
+        """You are an interactive CLI tool that helps with software engineering and production operations tasks. Please follows the instructions and tools below to help the user.
 
 # Tone and Style
 * Be concise, direct and to the point. When you are performing a non-trivial task, you should explain what it does and why you are doing it. This is especially important when you are making changes to the user's system.
@@ -1050,17 +1158,20 @@ Note that the contexts in $HOME/.nano-agent/ are universally applicable.
 </context>
 {% endfor %}
 {% endif %}
-'''
+"""
     )
-    return template.render(
-        context_filename=CONTEXT_FILENAME,
-        cwd=cwd,
-        is_git_repo=str(is_git_repo(cwd)).lower(),
-        os_name=platform.system(),
-        os_version=platform.release(),
-        date=time.strftime('%Y-%m-%d'),
-        contexts=contexts,
-    ).strip() + "\n"
+    return (
+        template.render(
+            context_filename=CONTEXT_FILENAME,
+            cwd=cwd,
+            is_git_repo=str(is_git_repo(cwd)).lower(),
+            os_name=platform.system(),
+            os_version=platform.release(),
+            date=time.strftime("%Y-%m-%d"),
+            contexts=contexts,
+        ).strip()
+        + "\n"
+    )
 
 
 @dataclass
@@ -1101,10 +1212,16 @@ class SessionUsage:
             last_input_tokens=_coerce_usage_int(value.get("last_input_tokens")),
             last_output_tokens=_coerce_usage_int(value.get("last_output_tokens")),
             last_total_tokens=_coerce_usage_int(value.get("last_total_tokens")),
-            last_cached_input_tokens=_coerce_usage_int(value.get("last_cached_input_tokens")),
+            last_cached_input_tokens=_coerce_usage_int(
+                value.get("last_cached_input_tokens")
+            ),
             last_reasoning_tokens=_coerce_usage_int(value.get("last_reasoning_tokens")),
-            last_api=value.get("last_api") if isinstance(value.get("last_api"), str) else None,
-            last_model=value.get("last_model") if isinstance(value.get("last_model"), str) else None,
+            last_api=value.get("last_api")
+            if isinstance(value.get("last_api"), str)
+            else None,
+            last_model=value.get("last_model")
+            if isinstance(value.get("last_model"), str)
+            else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1151,10 +1268,14 @@ def parse_skill_file(path: Path) -> SkillInfo | None:
     description = str(frontmatter.get("description", "")).strip()
     if not name or not description:
         return None
-    return SkillInfo(name=name, description=description, directory=path.parent, content=content)
+    return SkillInfo(
+        name=name, description=description, directory=path.parent, content=content
+    )
 
 
-def _discover_skills_from_dir(base: Path, prefix: str, found: dict[str, SkillInfo]) -> None:
+def _discover_skills_from_dir(
+    base: Path, prefix: str, found: dict[str, SkillInfo]
+) -> None:
     if not base.exists() or not base.is_dir():
         return
     for entry in sorted(base.iterdir(), key=lambda p: p.name):
@@ -1193,7 +1314,7 @@ def discover_skills(cwd: Path) -> dict[str, SkillInfo]:
 
 def skill_description(skills: dict[str, SkillInfo]) -> str:
     template = JINJA.from_string(
-        '''When users ask you to perform tasks, check if any of the available skills below can help complete the task more effectively. Skills provide specialized capabilities and domain knowledge.
+        """When users ask you to perform tasks, check if any of the available skills below can help complete the task more effectively. Skills provide specialized capabilities and domain knowledge.
 
 # Usage
 - Use this tool with the skill name only
@@ -1224,14 +1345,14 @@ def skill_description(skills: dict[str, SkillInfo]) -> str:
 {% else %}
 Skills are currently not available.
 {% endif %}
-'''
+"""
     )
     return template.render(skills=[skills[name] for name in sorted(skills)]).rstrip()
 
 
 def bash_description() -> str:
     return JINJA.from_string(
-        '''Run a bash command in an isolated shell process.
+        """Run a bash command in an isolated shell process.
 
 # Restrictions
 Banned commands:
@@ -1256,13 +1377,13 @@ Banned commands:
 
 Examples:
 - (cd /repo && mise run test)
-'''
+"""
     ).render()
 
 
 def apply_patch_description() -> str:
     return JINJA.from_string(
-        '''Use the `apply_patch` tool to edit files.
+        """Use the `apply_patch` tool to edit files.
 Your patch language is a stripped-down, file-oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high-level envelope:
 
 *** Begin Patch
@@ -1329,13 +1450,13 @@ It is important to remember:
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with `+` even when creating a new file
 - File references may be relative or absolute. Relative paths are resolved from the current working directory.
-'''
+"""
     ).render()
 
 
 def web_fetch_description() -> str:
     return JINJA.from_string(
-        '''Fetch content from a public URL.
+        """Fetch content from a public URL.
 
 # Input
 - url: required URL to fetch
@@ -1378,7 +1499,7 @@ Examples:
 # Notes
 - Only public URLs are supported (no auth/session handling).
 - Prompt is ignored for non-HTML/Markdown responses (code/text/JSON/XML).
-'''
+"""
     ).render()
 
 
@@ -1387,8 +1508,14 @@ def bash_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "The bash command to run"},
-            "description": {"type": "string", "description": "A description of the command to run"},
-            "timeout": {"type": "integer", "description": "Timeout in seconds (10-120)"},
+            "description": {
+                "type": "string",
+                "description": "A description of the command to run",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds (10-120)",
+            },
         },
         "required": ["command", "description", "timeout"],
         "additionalProperties": False,
@@ -1469,25 +1596,39 @@ def _extract_usage_metrics(value: Any) -> dict[str, int] | None:
     if "input_tokens" in plain or "output_tokens" in plain:
         input_tokens = _coerce_usage_int(plain.get("input_tokens"))
         output_tokens = _coerce_usage_int(plain.get("output_tokens"))
-        total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (input_tokens + output_tokens)
+        total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (
+            input_tokens + output_tokens
+        )
         raw_input_details = plain.get("input_tokens_details")
-        input_details: dict[str, Any] = raw_input_details if isinstance(raw_input_details, dict) else {}
+        input_details: dict[str, Any] = (
+            raw_input_details if isinstance(raw_input_details, dict) else {}
+        )
         raw_output_details = plain.get("output_tokens_details")
-        output_details: dict[str, Any] = raw_output_details if isinstance(raw_output_details, dict) else {}
+        output_details: dict[str, Any] = (
+            raw_output_details if isinstance(raw_output_details, dict) else {}
+        )
         return {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cached_input_tokens": _coerce_usage_int(input_details.get("cached_tokens")),
-            "reasoning_tokens": _coerce_usage_int(output_details.get("reasoning_tokens")),
+            "cached_input_tokens": _coerce_usage_int(
+                input_details.get("cached_tokens")
+            ),
+            "reasoning_tokens": _coerce_usage_int(
+                output_details.get("reasoning_tokens")
+            ),
         }
 
     if "prompt_tokens" in plain or "completion_tokens" in plain:
         input_tokens = _coerce_usage_int(plain.get("prompt_tokens"))
         output_tokens = _coerce_usage_int(plain.get("completion_tokens"))
-        total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (input_tokens + output_tokens)
+        total_tokens = _coerce_usage_int(plain.get("total_tokens")) or (
+            input_tokens + output_tokens
+        )
         raw_prompt_details = plain.get("prompt_tokens_details")
-        prompt_details: dict[str, Any] = raw_prompt_details if isinstance(raw_prompt_details, dict) else {}
+        prompt_details: dict[str, Any] = (
+            raw_prompt_details if isinstance(raw_prompt_details, dict) else {}
+        )
         raw_completion_details = plain.get("completion_tokens_details")
         completion_details: dict[str, Any] = (
             raw_completion_details if isinstance(raw_completion_details, dict) else {}
@@ -1496,8 +1637,12 @@ def _extract_usage_metrics(value: Any) -> dict[str, int] | None:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cached_input_tokens": _coerce_usage_int(prompt_details.get("cached_tokens")),
-            "reasoning_tokens": _coerce_usage_int(completion_details.get("reasoning_tokens")),
+            "cached_input_tokens": _coerce_usage_int(
+                prompt_details.get("cached_tokens")
+            ),
+            "reasoning_tokens": _coerce_usage_int(
+                completion_details.get("reasoning_tokens")
+            ),
         }
 
     return None
@@ -1519,7 +1664,11 @@ def _context_window_limit(model: str, provider: str = "copilot") -> int | None:
 
 
 def _is_copilot_claude_chat(provider: str, model: str) -> bool:
-    return _is_copilot_provider(provider) and _is_anthropic_like_model(model) and not should_use_responses_api(model)
+    return (
+        _is_copilot_provider(provider)
+        and _is_anthropic_like_model(model)
+        and not should_use_responses_api(model)
+    )
 
 
 def _format_ratio(value: int, total: int | None) -> str:
@@ -1559,7 +1708,9 @@ def _get_delta_fragments(delta: Any, keys: list[str]) -> list[str]:
     return fragments
 
 
-def _merge_stream_tool_call(accumulator: dict[int, dict[str, Any]], tool_call: Any) -> None:
+def _merge_stream_tool_call(
+    accumulator: dict[int, dict[str, Any]], tool_call: Any
+) -> None:
     plain = _to_plain_data(tool_call)
     if not isinstance(plain, dict):
         return
@@ -1612,11 +1763,20 @@ def apply_copilot_ephemeral_cache(
     provider: str,
     model: str,
 ) -> list[dict[str, Any]]:
-    if not _is_copilot_provider(provider) or not model_supports_endpoint("/chat/completions", model, provider=provider):
+    if not _is_copilot_provider(provider) or not model_supports_endpoint(
+        "/chat/completions", model, provider=provider
+    ):
         return messages
-
-    system_indexes = [index for index, message in enumerate(messages) if message.get("role") == "system"][:2]
-    final_indexes = [index for index, message in enumerate(messages) if message.get("role") != "system"][-2:]
+    system_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "system"
+    ][:2]
+    final_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") != "system"
+    ][-2:]
 
     target_indexes: list[int] = []
     seen_indexes: set[int] = set()
@@ -1682,7 +1842,9 @@ def extract_function_calls_from_response(response: Any) -> list[dict[str, Any]]:
     return calls
 
 
-def chat_tools_to_responses_tools(chat_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def chat_tools_to_responses_tools(
+    chat_tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
     for tool in chat_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
@@ -1699,7 +1861,9 @@ def chat_tools_to_responses_tools(chat_tools: list[dict[str, Any]]) -> list[dict
     return tools
 
 
-def chat_tools_to_anthropic_tools(chat_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def chat_tools_to_anthropic_tools(
+    chat_tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
     for tool in chat_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
@@ -1728,7 +1892,9 @@ def anthropic_thinking_config(reasoning_effort: str | None) -> dict[str, Any] | 
     return {"type": "adaptive"}
 
 
-def build_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
+def build_anthropic_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
     system_blocks: list[dict[str, Any]] = []
     anthropic_messages: list[dict[str, Any]] = []
 
@@ -1764,10 +1930,16 @@ def build_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | list
                     if not isinstance(call, dict):
                         continue
                     raw_function = call.get("function")
-                    function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
+                    function: dict[str, Any] = (
+                        raw_function if isinstance(raw_function, dict) else {}
+                    )
                     arguments = function.get("arguments")
                     try:
-                        parsed_input = json.loads(arguments) if isinstance(arguments, str) and arguments else {}
+                        parsed_input = (
+                            json.loads(arguments)
+                            if isinstance(arguments, str) and arguments
+                            else {}
+                        )
                     except json.JSONDecodeError:
                         parsed_input = {}
                     blocks.append(
@@ -1775,7 +1947,9 @@ def build_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | list
                             "type": "tool_use",
                             "id": call.get("id") or str(uuid.uuid4()),
                             "name": function.get("name") or "",
-                            "input": parsed_input if isinstance(parsed_input, dict) else {},
+                            "input": parsed_input
+                            if isinstance(parsed_input, dict)
+                            else {},
                         }
                     )
 
@@ -1792,7 +1966,9 @@ def build_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | list
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_call_id or "",
-                            "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
+                            "content": content
+                            if isinstance(content, str)
+                            else json.dumps(content, ensure_ascii=False),
                         }
                     ],
                 }
@@ -1826,16 +2002,28 @@ class BashRunner:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            stdout = (
+                exc.stdout.decode(errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            stderr = (
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
             output, _truncated = truncate_tool_output((stdout + stderr).rstrip())
-            raise TimeoutError(f"command timed out after {timeout} seconds\n{output}") from exc
+            raise TimeoutError(
+                f"command timed out after {timeout} seconds\n{output}"
+            ) from exc
 
         output, truncated = truncate_tool_output(result.stdout.rstrip())
         return result.returncode, output, truncated
 
 
-def validate_bash_args(command: Any, description: Any, timeout: Any) -> tuple[str, str, int]:
+def validate_bash_args(
+    command: Any, description: Any, timeout: Any
+) -> tuple[str, str, int]:
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command is required")
     if "\n" in command or "\r" in command:
@@ -1892,7 +2080,9 @@ def resolve_patch_path(cwd: Path, patch_path: str) -> Path:
 def parse_apply_patch(patch_text: str) -> list[FilePatch]:
     lines = patch_text.splitlines()
     if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
-        raise ValueError("Patch must start with '*** Begin Patch' and end with '*** End Patch'")
+        raise ValueError(
+            "Patch must start with '*** Begin Patch' and end with '*** End Patch'"
+        )
 
     ops: list[FilePatch] = []
     i = 1
@@ -1920,14 +2110,20 @@ def parse_apply_patch(patch_text: str) -> list[FilePatch]:
             patch = FilePatch(op="update", path=path)
             i += 1
             if i < len(lines) - 1 and lines[i].startswith("*** Move to: "):
-                patch.move_to = _validate_patch_path(lines[i].removeprefix("*** Move to: ").strip())
+                patch.move_to = _validate_patch_path(
+                    lines[i].removeprefix("*** Move to: ").strip()
+                )
                 i += 1
             while i < len(lines) - 1 and not lines[i].startswith("*** "):
                 if not lines[i].startswith("@@"):
                     raise ValueError(f"Expected hunk header, got: {lines[i]}")
                 hunk = Hunk(header=lines[i][2:].strip())
                 i += 1
-                while i < len(lines) - 1 and not lines[i].startswith("@@") and not lines[i].startswith("*** "):
+                while (
+                    i < len(lines) - 1
+                    and not lines[i].startswith("@@")
+                    and not lines[i].startswith("*** ")
+                ):
                     if lines[i] == "*** End of File":
                         i += 1
                         continue
@@ -1947,7 +2143,9 @@ def parse_apply_patch(patch_text: str) -> list[FilePatch]:
     return ops
 
 
-def _find_hunk_position(source_lines: list[str], needle: list[str], start: int) -> int | None:
+def _find_hunk_position(
+    source_lines: list[str], needle: list[str], start: int
+) -> int | None:
     if not needle:
         return start
     max_start = len(source_lines) - len(needle)
@@ -1959,7 +2157,9 @@ def _find_hunk_position(source_lines: list[str], needle: list[str], start: int) 
             return candidate
     stripped_needle = [line.rstrip() for line in needle]
     for candidate in range(start, max_start + 1):
-        if [line.rstrip() for line in source_lines[candidate : candidate + len(needle)]] == stripped_needle:
+        if [
+            line.rstrip() for line in source_lines[candidate : candidate + len(needle)]
+        ] == stripped_needle:
             return candidate
     return None
 
@@ -2031,11 +2231,13 @@ def execute_apply_patch(patch_text: str, cwd: Path) -> dict[str, Any]:
             write_target.write_text(new)
             if op.move_to and write_target.resolve() != target.resolve():
                 target.unlink()
-            changes.append({
-                "action": "update",
-                "path": str(target),
-                "move_to": str(write_target) if op.move_to else None,
-            })
+            changes.append(
+                {
+                    "action": "update",
+                    "path": str(target),
+                    "move_to": str(write_target) if op.move_to else None,
+                }
+            )
             diffs.append(
                 _unified_diff(
                     old,
@@ -2085,7 +2287,9 @@ async def fetch_with_same_domain_redirects(raw_url: str) -> tuple[str, str]:
                 current = urljoin(current, location)
                 new_host = (urlparse(current).hostname or "").lower()
                 if new_host != original_host:
-                    raise ValueError("redirects are only followed within the same domain")
+                    raise ValueError(
+                        "redirects are only followed within the same domain"
+                    )
                 continue
             response.raise_for_status()
             content_type = response.headers.get("content-type", "text/plain").lower()
@@ -2097,7 +2301,9 @@ async def fetch_with_same_domain_redirects(raw_url: str) -> tuple[str, str]:
                 or content_type.startswith("video/")
                 or "application/octet-stream" in content_type
             ):
-                raise ValueError(f"binary content type is not supported: {content_type}")
+                raise ValueError(
+                    f"binary content type is not supported: {content_type}"
+                )
             return response.text, content_type
     raise ValueError("too many redirects")
 
@@ -2145,7 +2351,9 @@ def add_line_numbers(text: str, max_lines: int = 400, max_chars: int = 30000) ->
     return numbered
 
 
-def truncate_tool_output(text: str, max_bytes: int = MAX_TOOL_OUTPUT_BYTES) -> tuple[str, bool]:
+def truncate_tool_output(
+    text: str, max_bytes: int = MAX_TOOL_OUTPUT_BYTES
+) -> tuple[str, bool]:
     output_bytes = text.encode("utf-8")
     if len(output_bytes) <= max_bytes:
         return text, False
@@ -2265,7 +2473,10 @@ def self_test_build_anthropic_messages() -> None:
                 "tool_calls": [
                     {
                         "id": "call-1",
-                        "function": {"name": "bash", "arguments": '{"command":"echo hi"}'},
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command":"echo hi"}',
+                        },
                     }
                 ],
             },
@@ -2275,7 +2486,9 @@ def self_test_build_anthropic_messages() -> None:
     _assert_equal(system, "sys")
     _assert_equal(messages[0], {"role": "user", "content": "hello"})
     assistant_blocks = messages[1]["content"]
-    _assert_true(isinstance(assistant_blocks, list), "assistant content should be block list")
+    _assert_true(
+        isinstance(assistant_blocks, list), "assistant content should be block list"
+    )
     _assert_equal(assistant_blocks[1]["type"], "tool_use")
     _assert_equal(messages[2]["content"][0]["type"], "tool_result")
 
@@ -2310,6 +2523,10 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
             "version": "claude-unspecified-endpoints",
             "supported_endpoints": [],
         },
+        {
+            "id": "claude-missing-endpoints",
+            "version": "claude-missing-endpoints",
+        },
     ]
     COPILOT_MODELS_CACHE_EXPIRES_AT = time.time() + MODELS_CACHE_TTL_SECONDS
 
@@ -2322,26 +2539,59 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
             {"role": "user", "content": [{"type": "text", "text": "user-2"}]},
         ]
 
-        patched = apply_copilot_ephemeral_cache(messages, provider="copilot", model="claude-chat")
-        _assert_true(patched is not messages, "cache application should return a copied message list")
+        patched = apply_copilot_ephemeral_cache(
+            messages, provider="copilot", model="claude-chat"
+        )
+        _assert_true(
+            patched is not messages,
+            "cache application should return a copied message list",
+        )
         _assert_equal(patched[0]["copilot_cache_control"]["type"], "ephemeral")
-        _assert_equal(patched[1]["content"][-1]["copilot_cache_control"]["type"], "ephemeral")
+        _assert_equal(
+            patched[1]["content"][-1]["copilot_cache_control"]["type"], "ephemeral"
+        )
         _assert_equal(patched[3]["copilot_cache_control"]["type"], "ephemeral")
-        _assert_equal(patched[4]["content"][-1]["copilot_cache_control"]["type"], "ephemeral")
-        _assert_true("copilot_cache_control" not in messages[0], "original messages should remain unchanged")
+        _assert_equal(
+            patched[4]["content"][-1]["copilot_cache_control"]["type"], "ephemeral"
+        )
+        _assert_true(
+            "copilot_cache_control" not in messages[0],
+            "original messages should remain unchanged",
+        )
 
-        unchanged = apply_copilot_ephemeral_cache(messages, provider="copilot", model="claude-messages-only")
-        _assert_true(unchanged is messages, "messages-only models should not be patched")
+        unchanged = apply_copilot_ephemeral_cache(
+            messages, provider="copilot", model="claude-messages-only"
+        )
+        _assert_true(
+            unchanged is messages, "messages-only models should not be patched"
+        )
 
         unspecified = apply_copilot_ephemeral_cache(
             messages,
             provider="copilot",
             model="claude-unspecified-endpoints",
         )
-        _assert_true(unspecified is not messages, "empty supported_endpoints should allow patching")
+        _assert_true(
+            unspecified is not messages,
+            "empty supported_endpoints should allow patching",
+        )
 
-        wrong_provider = apply_copilot_ephemeral_cache(messages, provider="openai", model="claude-chat")
-        _assert_true(wrong_provider is messages, "non-copilot providers should not be patched")
+        missing = apply_copilot_ephemeral_cache(
+            messages,
+            provider="copilot",
+            model="claude-missing-endpoints",
+        )
+        _assert_true(
+            missing is not messages,
+            "missing supported_endpoints should allow patching",
+        )
+
+        wrong_provider = apply_copilot_ephemeral_cache(
+            messages, provider="openai", model="claude-chat"
+        )
+        _assert_true(
+            wrong_provider is messages, "non-copilot providers should not be patched"
+        )
     finally:
         COPILOT_MODELS_CACHE = original_cache
         COPILOT_MODELS_CACHE_EXPIRES_AT = original_cache_expires_at
@@ -2351,7 +2601,9 @@ def self_test_models_cache_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "models.json"
         now = datetime(2026, 3, 13, tzinfo=timezone.utc).timestamp()
-        models = [{"id": "claude-sonnet-4.5", "supported_endpoints": ["/chat/completions"]}]
+        models = [
+            {"id": "claude-sonnet-4.5", "supported_endpoints": ["/chat/completions"]}
+        ]
 
         expires_at = save_cached_provider_models(
             "copilot",
@@ -2393,7 +2645,9 @@ def self_test_truncate_tool_output() -> None:
         "truncated output should respect the byte limit",
     )
     _assert_true(
-        truncated_output.endswith(f"... [truncated due to max output bytes limit of {MAX_TOOL_OUTPUT_BYTES}]"),
+        truncated_output.endswith(
+            f"... [truncated due to max output bytes limit of {MAX_TOOL_OUTPUT_BYTES}]"
+        ),
         "truncated output should include a clear truncation marker",
     )
 
@@ -2406,7 +2660,9 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
     SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
     SelfTestCase("copilot_headers", self_test_copilot_headers),
-    SelfTestCase("apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache),
+    SelfTestCase(
+        "apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache
+    ),
     SelfTestCase("models_cache_roundtrip", self_test_models_cache_roundtrip),
     SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
 ]
@@ -2433,7 +2689,9 @@ def run_self_tests() -> None:
 
     console.print(table)
     if failed:
-        raise click.ClickException(f"self-test failed: {failed} of {passed + failed} tests failed")
+        raise click.ClickException(
+            f"self-test failed: {failed} of {passed + failed} tests failed"
+        )
     console.print(f"[green]All self-tests passed ({passed}).[/green]")
 
 
@@ -2478,9 +2736,13 @@ class NanoAgent:
         self.model = model
         self.cwd = cwd.resolve()
         self.provider = provider
-        self.session_id = normalize_session_id(session_id) if session_id else str(uuid.uuid4())
+        self.session_id = (
+            normalize_session_id(session_id) if session_id else str(uuid.uuid4())
+        )
         self.history_path = conversation_history_path(self.session_id)
-        self.reasoning_effort = None if reasoning_effort in {None, "none"} else reasoning_effort
+        self.reasoning_effort = (
+            None if reasoning_effort in {None, "none"} else reasoning_effort
+        )
         self.created_at = iso_now()
         if self.history_path.exists():
             try:
@@ -2488,9 +2750,13 @@ class NanoAgent:
                 self.created_at = cast(str, existing["created_at"])
             except Exception:
                 pass
-        self.client = create_client(provider=provider, api_key=api_key, base_url=base_url)
+        self.client = create_client(
+            provider=provider, api_key=api_key, base_url=base_url
+        )
         self.anthropic_client = (
-            create_anthropic_copilot_client() if should_use_anthropic_messages_api(provider, model) else None
+            create_anthropic_copilot_client()
+            if should_use_anthropic_messages_api(provider, model)
+            else None
         )
         self.messages: list[dict[str, Any]] = list(messages or [])
         self.responses_items: list[dict[str, Any]] = list(responses_items or [])
@@ -2513,15 +2779,21 @@ class NanoAgent:
             return None
         return self.session_id
 
-    def prepare_chat_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return apply_copilot_ephemeral_cache(messages, provider=self.provider, model=self.model)
+    def prepare_chat_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return apply_copilot_ephemeral_cache(
+            messages, provider=self.provider, model=self.model
+        )
 
     def chat_extra_body(self) -> dict[str, Any] | None:
         if _is_copilot_claude_chat(self.provider, self.model):
             return {"thinking_budget": 4000}
         return None
 
-    def record_usage(self, usage_value: Any, *, api: str, model: str | None = None) -> None:
+    def record_usage(
+        self, usage_value: Any, *, api: str, model: str | None = None
+    ) -> None:
         metrics = _extract_usage_metrics(usage_value)
         if not metrics:
             return
@@ -2559,9 +2831,13 @@ class NanoAgent:
 
     def save_history(self) -> None:
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
-        self.history_path.write_text(json.dumps(self.serialized_history(), indent=2) + "\n")
+        self.history_path.write_text(
+            json.dumps(self.serialized_history(), indent=2) + "\n"
+        )
 
-    async def execute_tool_calls(self, tool_calls: list[dict[str, Any]], *, call_id_key: str) -> list[dict[str, Any]]:
+    async def execute_tool_calls(
+        self, tool_calls: list[dict[str, Any]], *, call_id_key: str
+    ) -> list[dict[str, Any]]:
         tool_outputs: list[dict[str, Any]] = []
         for call in tool_calls:
             try:
@@ -2595,7 +2871,9 @@ class NanoAgent:
 
     def _finalize_response_turn(self, final_response: Any) -> AssistantTurn:
         output_text = getattr(final_response, "output_text", None)
-        assistant_text = output_text if isinstance(output_text, str) and output_text else None
+        assistant_text = (
+            output_text if isinstance(output_text, str) and output_text else None
+        )
         plain_response = _to_plain_data(final_response) or {}
         output_items = plain_response.get("output") or []
         responses_items = output_items if isinstance(output_items, list) else []
@@ -2726,7 +3004,11 @@ class NanoAgent:
             if reasoning:
                 kwargs["reasoning"] = reasoning
             response = await self.client.responses.create(**kwargs)
-            self.record_usage(getattr(response, "usage", None), api="responses", model=getattr(response, "model", None))
+            self.record_usage(
+                getattr(response, "usage", None),
+                api="responses",
+                model=getattr(response, "model", None),
+            )
             plain = _to_plain_data(response) or {}
             output_text = getattr(response, "output_text", None)
             if isinstance(output_text, str) and output_text:
@@ -2736,7 +3018,9 @@ class NanoAgent:
                 if not isinstance(item, dict):
                     continue
                 for content_item in item.get("content") or []:
-                    if isinstance(content_item, dict) and isinstance(content_item.get("text"), str):
+                    if isinstance(content_item, dict) and isinstance(
+                        content_item.get("text"), str
+                    ):
                         fragments.append(content_item["text"])
             return "".join(fragments)
 
@@ -2757,7 +3041,11 @@ class NanoAgent:
             extra_body=self.chat_extra_body(),
             **self.completion_kwargs(),
         )
-        self.record_usage(getattr(response, "usage", None), api="chat.completions", model=getattr(response, "model", None))
+        self.record_usage(
+            getattr(response, "usage", None),
+            api="chat.completions",
+            model=getattr(response, "model", None),
+        )
         return response.choices[0].message.content or ""
 
     async def send_via_responses(self) -> None:
@@ -2809,7 +3097,9 @@ class NanoAgent:
             if not turn.tool_calls:
                 return
 
-            tool_outputs = await self.execute_tool_calls(turn.tool_calls, call_id_key="call_id")
+            tool_outputs = await self.execute_tool_calls(
+                turn.tool_calls, call_id_key="call_id"
+            )
             self.responses_items.extend(tool_outputs)
 
     async def send_via_chat_completions(self) -> None:
@@ -2821,7 +3111,10 @@ class NanoAgent:
             chat_messages = cast(
                 list[ChatCompletionMessageParam],
                 self.prepare_chat_messages(
-                    [{"role": "system", "content": self.system_prompt()}, *self.messages]
+                    [
+                        {"role": "system", "content": self.system_prompt()},
+                        *self.messages,
+                    ]
                 ),
             )
             chat_tools = cast(list[ChatCompletionToolParam], self.tool_specs())
@@ -2854,7 +3147,9 @@ class NanoAgent:
                 if isinstance(opaque, str) and opaque:
                     reasoning_opaque = opaque
 
-                for fragment in _get_delta_fragments(delta, ["reasoning_text", "reasoning", "thinking"]):
+                for fragment in _get_delta_fragments(
+                    delta, ["reasoning_text", "reasoning", "thinking"]
+                ):
                     if fragment:
                         self.ui.update_assistant(reasoning_fragment=fragment)
                         assistant_reasoning_parts.append(fragment)
@@ -2942,11 +3237,19 @@ class NanoAgent:
             if usage_value is not None:
                 self.record_usage(
                     {
-                        "input_tokens": _coerce_usage_int(getattr(usage_value, "input_tokens", 0)),
-                        "output_tokens": _coerce_usage_int(getattr(usage_value, "output_tokens", 0)),
-                        "total_tokens": _coerce_usage_int(getattr(usage_value, "input_tokens", 0))
+                        "input_tokens": _coerce_usage_int(
+                            getattr(usage_value, "input_tokens", 0)
+                        ),
+                        "output_tokens": _coerce_usage_int(
+                            getattr(usage_value, "output_tokens", 0)
+                        ),
+                        "total_tokens": _coerce_usage_int(
+                            getattr(usage_value, "input_tokens", 0)
+                        )
                         + _coerce_usage_int(getattr(usage_value, "output_tokens", 0)),
-                        "cached_input_tokens": _coerce_usage_int(getattr(usage_value, "cache_read_input_tokens", 0)),
+                        "cached_input_tokens": _coerce_usage_int(
+                            getattr(usage_value, "cache_read_input_tokens", 0)
+                        ),
                         "reasoning_tokens": 0,
                     },
                     api="messages",
@@ -2998,16 +3301,18 @@ class NanoAgent:
                 skills = self.current_skills()
                 if skill_name not in skills:
                     available = ", ".join(sorted(skills)) or "none"
-                    raise ValueError(f"unknown skill '{skill_name}'. Available skills: {available}")
+                    raise ValueError(
+                        f"unknown skill '{skill_name}'. Available skills: {available}"
+                    )
                 if skill_name in self.active_skills:
                     raise ValueError(f"skill '{skill_name}' is already active")
                 self.active_skills.add(skill_name)
                 skill = skills[skill_name]
-                content = f'''# Skill: {skill.name}
+                content = f"""# Skill: {skill.name}
 
 The skill directory is located at: {skill.directory}
 
-{skill.content}'''
+{skill.content}"""
                 return {
                     "success": True,
                     "skill_name": skill.name,
@@ -3107,7 +3412,9 @@ async def run_chat(
             await agent.send(prompt)
             return
 
-        agent.ui.startup(provider, model, reasoning_effort, agent.session_id, resumed=resumed)
+        agent.ui.startup(
+            provider, model, reasoning_effort, agent.session_id, resumed=resumed
+        )
         while True:
             try:
                 user_input = await agent.ui.prompt()
@@ -3138,10 +3445,14 @@ async def run_chat(
 )
 @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Model to use")
 @click.option("--api-key", help="API key for direct OpenAI-compatible endpoint mode")
-@click.option("--base-url", help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--base-url", help="Custom base URL for direct OpenAI-compatible endpoint mode"
+)
 @click.option(
     "--reasoning-effort",
-    type=click.Choice(["none", "minimal", "low", "medium", "high"], case_sensitive=False),
+    type=click.Choice(
+        ["none", "minimal", "low", "medium", "high"], case_sensitive=False
+    ),
     default=DEFAULT_REASONING_EFFORT,
     show_default=True,
     help="Reasoning effort for supported models",
@@ -3183,7 +3494,9 @@ def main(
 @cast(Any, main).command(
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
 )
-@click.option("--resume", default=None, help="Resume a saved conversation by session UUID")
+@click.option(
+    "--resume", default=None, help="Resume a saved conversation by session UUID"
+)
 @click.option(
     "--provider",
     type=click.Choice(["copilot", "openai"], case_sensitive=False),
@@ -3191,11 +3504,19 @@ def main(
     help="LLM provider to use",
 )
 @click.option("--model", default=None, help="Model to use")
-@click.option("--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode")
-@click.option("--base-url", default=None, help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode"
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Custom base URL for direct OpenAI-compatible endpoint mode",
+)
 @click.option(
     "--reasoning-effort",
-    type=click.Choice(["none", "minimal", "low", "medium", "high"], case_sensitive=False),
+    type=click.Choice(
+        ["none", "minimal", "low", "medium", "high"], case_sensitive=False
+    ),
     default=None,
     help="Reasoning effort for supported models",
 )
@@ -3250,8 +3571,12 @@ def run(
         if model_source not in {None, ParameterSource.DEFAULT}
         else restored_model or cast(str, config["model"])
     )
-    resolved_api_key = api_key if api_key is not None else cast(str | None, config["api_key"])
-    resolved_base_url = base_url if base_url is not None else cast(str | None, config["base_url"])
+    resolved_api_key = (
+        api_key if api_key is not None else cast(str | None, config["api_key"])
+    )
+    resolved_base_url = (
+        base_url if base_url is not None else cast(str | None, config["base_url"])
+    )
     resolved_reasoning_effort = (
         reasoning_effort
         if reasoning_source not in {None, ParameterSource.DEFAULT}
@@ -3285,8 +3610,13 @@ def run(
         click.echo()
 
 
-@cast(Any, main).command(name="chat", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-@click.option("--resume", default=None, help="Resume a saved conversation by session UUID")
+@cast(Any, main).command(
+    name="chat",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+@click.option(
+    "--resume", default=None, help="Resume a saved conversation by session UUID"
+)
 @click.option(
     "--provider",
     type=click.Choice(["copilot", "openai"], case_sensitive=False),
@@ -3294,11 +3624,19 @@ def run(
     help="LLM provider to use",
 )
 @click.option("--model", default=None, help="Model to use")
-@click.option("--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode")
-@click.option("--base-url", default=None, help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode"
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Custom base URL for direct OpenAI-compatible endpoint mode",
+)
 @click.option(
     "--reasoning-effort",
-    type=click.Choice(["none", "minimal", "low", "medium", "high"], case_sensitive=False),
+    type=click.Choice(
+        ["none", "minimal", "low", "medium", "high"], case_sensitive=False
+    ),
     default=None,
     help="Reasoning effort for supported models",
 )
@@ -3328,7 +3666,9 @@ def chat(
 
 
 @cast(Any, main).command()
-@click.option("--output", type=click.Path(path_type=Path), help="Credentials output path")
+@click.option(
+    "--output", type=click.Path(path_type=Path), help="Credentials output path"
+)
 def login(output: Path | None) -> None:
     """Authenticate with GitHub Copilot."""
     try:
@@ -3372,8 +3712,14 @@ def history_command() -> None:
     default=None,
     help="LLM provider to query",
 )
-@click.option("--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode")
-@click.option("--base-url", default=None, help="Custom base URL for direct OpenAI-compatible endpoint mode")
+@click.option(
+    "--api-key", default=None, help="API key for direct OpenAI-compatible endpoint mode"
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Custom base URL for direct OpenAI-compatible endpoint mode",
+)
 @click.pass_context
 def models_command(
     ctx: click.Context,
@@ -3384,8 +3730,12 @@ def models_command(
     """List available models."""
     config = ctx.find_root().obj or {}
     resolved_provider = provider or cast(str, config["provider"])
-    resolved_api_key = api_key if api_key is not None else cast(str | None, config["api_key"])
-    resolved_base_url = base_url if base_url is not None else cast(str | None, config["base_url"])
+    resolved_api_key = (
+        api_key if api_key is not None else cast(str | None, config["api_key"])
+    )
+    resolved_base_url = (
+        base_url if base_url is not None else cast(str | None, config["base_url"])
+    )
 
     try:
         models = list_provider_models(
