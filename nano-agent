@@ -72,8 +72,10 @@ BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 MAX_TOOL_OUTPUT_BYTES = 32 * 1024
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
 HISTORY_DIR = Path.home() / ".nano-agent" / "history"
+MODELS_CACHE_TTL_SECONDS = 300
 JINJA = Environment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
 COPILOT_MODELS_CACHE: list[dict[str, Any]] | None = None
+COPILOT_MODELS_CACHE_EXPIRES_AT: float | None = None
 
 
 class CopilotAuthError(Exception):
@@ -318,6 +320,13 @@ def credentials_path() -> Path:
     return Path.home() / ".nano-agent" / "copilot.json"
 
 
+def models_cache_path() -> Path:
+    raw = os.getenv("NANO_AGENT_MODELS_CACHE")
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".nano-agent" / "models.json"
+
+
 def normalize_session_id(value: str) -> str:
     session_id = value.strip()
     if session_id.endswith(".json"):
@@ -466,6 +475,82 @@ def _coerce_expires_at(value: Any) -> float:
     raise CopilotAuthError(f"Unsupported expires_at value: {value!r}")
 
 
+def _load_models_cache_data(path: Path | None = None) -> dict[str, Any]:
+    target = path or models_cache_path()
+    try:
+        data = json.loads(target.read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_models_cache_data(data: dict[str, Any], path: Path | None = None) -> None:
+    target = path or models_cache_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def load_cached_provider_models(
+    provider: str,
+    *,
+    ttl_seconds: int = MODELS_CACHE_TTL_SECONDS,
+    path: Path | None = None,
+    now: float | None = None,
+) -> tuple[list[dict[str, Any]] | None, float | None]:
+    data = _load_models_cache_data(path)
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return None, None
+
+    entry = providers.get(provider.strip().lower())
+    if not isinstance(entry, dict):
+        return None, None
+
+    fetched_at = entry.get("fetched_at")
+    try:
+        fetched_at_ts = _coerce_expires_at(fetched_at)
+    except Exception:
+        return None, None
+
+    current_time = time.time() if now is None else now
+    expires_at = fetched_at_ts + ttl_seconds
+    if current_time >= expires_at:
+        return None, expires_at
+
+    models = entry.get("models")
+    if not isinstance(models, list):
+        return None, expires_at
+    return [item for item in models if isinstance(item, dict)], expires_at
+
+
+def save_cached_provider_models(
+    provider: str,
+    models: list[dict[str, Any]],
+    *,
+    fetched_at: str | None = None,
+    path: Path | None = None,
+) -> float:
+    timestamp = fetched_at or iso_now()
+    data = _load_models_cache_data(path)
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers[provider.strip().lower()] = {
+        "fetched_at": timestamp,
+        "models": [dict(item) for item in models if isinstance(item, dict)],
+    }
+    data["providers"] = providers
+    _save_models_cache_data(data, path)
+    return _coerce_expires_at(timestamp) + MODELS_CACHE_TTL_SECONDS
+
+
+def _set_copilot_models_cache(models: list[dict[str, Any]], *, expires_at: float | None) -> None:
+    global COPILOT_MODELS_CACHE
+    global COPILOT_MODELS_CACHE_EXPIRES_AT
+    COPILOT_MODELS_CACHE = [dict(item) for item in models]
+    COPILOT_MODELS_CACHE_EXPIRES_AT = expires_at
+
+
 def load_copilot_credentials() -> dict[str, Any]:
     path = credentials_path()
     if not path.exists():
@@ -588,13 +673,32 @@ def resolve_openai_base_url(base_url: str | None) -> str | None:
     return base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
 
 
-def list_provider_models(provider: str, api_key: str | None = None, base_url: str | None = None) -> list[dict[str, Any]]:
+def list_provider_models(
+    provider: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    *,
+    force_reload: bool = False,
+) -> list[dict[str, Any]]:
     normalized = provider.strip().lower()
 
     if normalized == "copilot":
         global COPILOT_MODELS_CACHE
-        if api_key is None and base_url is None and COPILOT_MODELS_CACHE is not None:
+        global COPILOT_MODELS_CACHE_EXPIRES_AT
+        if (
+            not force_reload
+            and api_key is None
+            and base_url is None
+            and COPILOT_MODELS_CACHE is not None
+            and isinstance(COPILOT_MODELS_CACHE_EXPIRES_AT, (int, float))
+            and time.time() < COPILOT_MODELS_CACHE_EXPIRES_AT
+        ):
             return [dict(item) for item in COPILOT_MODELS_CACHE]
+        if not force_reload and api_key is None and base_url is None:
+            cached_models, expires_at = load_cached_provider_models("copilot")
+            if cached_models is not None:
+                _set_copilot_models_cache(cached_models, expires_at=expires_at)
+                return [dict(item) for item in cached_models]
         creds = load_copilot_credentials()
         copilot_token, _ = refresh_copilot_token(creds)
         response = httpx.get(
@@ -608,7 +712,8 @@ def list_provider_models(provider: str, api_key: str | None = None, base_url: st
             raise ValueError("Copilot models response is invalid")
         models = [item for item in payload["data"] if isinstance(item, dict)]
         if api_key is None and base_url is None:
-            COPILOT_MODELS_CACHE = [dict(item) for item in models]
+            expires_at = save_cached_provider_models("copilot", models)
+            _set_copilot_models_cache(models, expires_at=expires_at)
         return models
 
     if normalized == "openai":
@@ -641,6 +746,21 @@ def _model_catalog_entry(model: str, provider: str = "copilot") -> dict[str, Any
         if any(isinstance(candidate, str) and candidate.strip().lower() == normalized_model for candidate in candidates):
             return item
     return None
+
+
+def model_supports_endpoint(endpoint: str, model: str, provider: str = "copilot") -> bool:
+    try:
+        entry = _model_catalog_entry(model, provider=provider)
+    except Exception:
+        return False
+    supported_endpoints = entry.get("supported_endpoints") if isinstance(entry, dict) else None
+    if not isinstance(supported_endpoints, list):
+        return False
+    normalized_endpoint = endpoint.strip().lower()
+    return any(
+        isinstance(candidate, str) and candidate.strip().lower() == normalized_endpoint
+        for candidate in supported_endpoints
+    )
 
 
 def model_context_window_limit(model: str, provider: str = "copilot") -> int | None:
@@ -1490,7 +1610,7 @@ def apply_copilot_ephemeral_cache(
     provider: str,
     model: str,
 ) -> list[dict[str, Any]]:
-    if not _is_copilot_provider(provider) or not _is_anthropic_like_model(model):
+    if not _is_copilot_provider(provider) or not model_supports_endpoint("/chat/completions", model, provider=provider):
         return messages
 
     system_indexes = [index for index, message in enumerate(messages) if message.get("role") == "system"][:2]
@@ -2166,6 +2286,86 @@ def self_test_copilot_headers() -> None:
     _assert_true("X-Request-Id" in api_headers, "api headers should include request id")
 
 
+def self_test_apply_copilot_ephemeral_cache() -> None:
+    global COPILOT_MODELS_CACHE
+    global COPILOT_MODELS_CACHE_EXPIRES_AT
+
+    original_cache = COPILOT_MODELS_CACHE
+    original_cache_expires_at = COPILOT_MODELS_CACHE_EXPIRES_AT
+    COPILOT_MODELS_CACHE = [
+        {
+            "id": "claude-chat",
+            "version": "claude-chat",
+            "supported_endpoints": ["/v1/messages", "/chat/completions"],
+        },
+        {
+            "id": "claude-messages-only",
+            "version": "claude-messages-only",
+            "supported_endpoints": ["/v1/messages"],
+        },
+    ]
+    COPILOT_MODELS_CACHE_EXPIRES_AT = time.time() + MODELS_CACHE_TTL_SECONDS
+
+    try:
+        messages = [
+            {"role": "system", "content": "sys-1"},
+            {"role": "system", "content": [{"type": "text", "text": "sys-2"}]},
+            {"role": "user", "content": "user-1"},
+            {"role": "assistant", "content": "assistant-1"},
+            {"role": "user", "content": [{"type": "text", "text": "user-2"}]},
+        ]
+
+        patched = apply_copilot_ephemeral_cache(messages, provider="copilot", model="claude-chat")
+        _assert_true(patched is not messages, "cache application should return a copied message list")
+        _assert_equal(patched[0]["copilot_cache_control"]["type"], "ephemeral")
+        _assert_equal(patched[1]["content"][-1]["copilot_cache_control"]["type"], "ephemeral")
+        _assert_equal(patched[3]["copilot_cache_control"]["type"], "ephemeral")
+        _assert_equal(patched[4]["content"][-1]["copilot_cache_control"]["type"], "ephemeral")
+        _assert_true("copilot_cache_control" not in messages[0], "original messages should remain unchanged")
+
+        unchanged = apply_copilot_ephemeral_cache(messages, provider="copilot", model="claude-messages-only")
+        _assert_true(unchanged is messages, "messages-only models should not be patched")
+
+        wrong_provider = apply_copilot_ephemeral_cache(messages, provider="openai", model="claude-chat")
+        _assert_true(wrong_provider is messages, "non-copilot providers should not be patched")
+    finally:
+        COPILOT_MODELS_CACHE = original_cache
+        COPILOT_MODELS_CACHE_EXPIRES_AT = original_cache_expires_at
+
+
+def self_test_models_cache_roundtrip() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "models.json"
+        now = datetime(2026, 3, 13, tzinfo=timezone.utc).timestamp()
+        models = [{"id": "claude-sonnet-4.5", "supported_endpoints": ["/chat/completions"]}]
+
+        expires_at = save_cached_provider_models(
+            "copilot",
+            models,
+            fetched_at="2026-03-13T00:00:00Z",
+            path=path,
+        )
+        _assert_equal(expires_at, now + MODELS_CACHE_TTL_SECONDS)
+
+        loaded_models, loaded_expires_at = load_cached_provider_models(
+            "copilot",
+            ttl_seconds=MODELS_CACHE_TTL_SECONDS,
+            path=path,
+            now=now + 60,
+        )
+        _assert_equal(loaded_models, models)
+        _assert_equal(loaded_expires_at, expires_at)
+
+        stale_models, stale_expires_at = load_cached_provider_models(
+            "copilot",
+            ttl_seconds=MODELS_CACHE_TTL_SECONDS,
+            path=path,
+            now=expires_at,
+        )
+        _assert_equal(stale_models, None)
+        _assert_equal(stale_expires_at, expires_at)
+
+
 def self_test_truncate_tool_output() -> None:
     passthrough, passthrough_truncated = truncate_tool_output("hello world")
     _assert_equal(passthrough, "hello world")
@@ -2192,6 +2392,8 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
     SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
     SelfTestCase("copilot_headers", self_test_copilot_headers),
+    SelfTestCase("apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache),
+    SelfTestCase("models_cache_roundtrip", self_test_models_cache_roundtrip),
     SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
 ]
 
@@ -3176,6 +3378,7 @@ def models_command(
             provider=resolved_provider,
             api_key=resolved_api_key,
             base_url=resolved_base_url,
+            force_reload=True,
         )
         render_models_table(models, provider=resolved_provider)
     except CopilotAuthError as exc:
