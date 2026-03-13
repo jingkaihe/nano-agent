@@ -1206,7 +1206,7 @@ It is important to remember:
 
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with `+` even when creating a new file
-- File references can only be relative, NEVER ABSOLUTE.
+- File references may be relative or absolute. Relative paths are resolved from the current working directory.
 '''
     ).render()
 
@@ -1754,10 +1754,17 @@ class FilePatch:
     hunks: list[Hunk] = field(default_factory=list)
 
 
-def _require_relative_path(path: str) -> str:
-    if not path or Path(path).is_absolute():
-        raise ValueError("File references must be relative, NEVER ABSOLUTE")
+def _validate_patch_path(path: str) -> str:
+    if not path:
+        raise ValueError("File path is required")
     return path
+
+
+def resolve_patch_path(cwd: Path, patch_path: str) -> Path:
+    path = Path(patch_path)
+    if path.is_absolute():
+        return path
+    return (cwd / path).resolve()
 
 
 def parse_apply_patch(patch_text: str) -> list[FilePatch]:
@@ -1770,7 +1777,7 @@ def parse_apply_patch(patch_text: str) -> list[FilePatch]:
     while i < len(lines) - 1:
         line = lines[i]
         if line.startswith("*** Add File: "):
-            path = _require_relative_path(line.removeprefix("*** Add File: ").strip())
+            path = _validate_patch_path(line.removeprefix("*** Add File: ").strip())
             i += 1
             add_lines: list[str] = []
             while i < len(lines) - 1 and not lines[i].startswith("*** "):
@@ -1782,16 +1789,16 @@ def parse_apply_patch(patch_text: str) -> list[FilePatch]:
             ops.append(FilePatch(op="add", path=path, add_lines=add_lines))
             continue
         if line.startswith("*** Delete File: "):
-            path = _require_relative_path(line.removeprefix("*** Delete File: ").strip())
+            path = _validate_patch_path(line.removeprefix("*** Delete File: ").strip())
             ops.append(FilePatch(op="delete", path=path))
             i += 1
             continue
         if line.startswith("*** Update File: "):
-            path = _require_relative_path(line.removeprefix("*** Update File: ").strip())
+            path = _validate_patch_path(line.removeprefix("*** Update File: ").strip())
             patch = FilePatch(op="update", path=path)
             i += 1
             if i < len(lines) - 1 and lines[i].startswith("*** Move to: "):
-                patch.move_to = _require_relative_path(lines[i].removeprefix("*** Move to: ").strip())
+                patch.move_to = _validate_patch_path(lines[i].removeprefix("*** Move to: ").strip())
                 i += 1
             while i < len(lines) - 1 and not lines[i].startswith("*** "):
                 if not lines[i].startswith("@@"):
@@ -1872,14 +1879,14 @@ def execute_apply_patch(patch_text: str, cwd: Path) -> dict[str, Any]:
     diffs: list[str] = []
 
     for op in ops:
-        target = cwd / op.path
+        target = resolve_patch_path(cwd, op.path)
         if op.op == "add":
             target.parent.mkdir(parents=True, exist_ok=True)
             content = "\n".join(op.add_lines)
             if op.add_lines:
                 content += "\n"
             target.write_text(content)
-            changes.append({"action": "add", "path": op.path})
+            changes.append({"action": "add", "path": str(target)})
             diffs.append(_unified_diff("", content, f"a/{op.path}", f"b/{op.path}"))
             continue
 
@@ -1888,7 +1895,7 @@ def execute_apply_patch(patch_text: str, cwd: Path) -> dict[str, Any]:
                 raise ValueError(f"Cannot delete missing file: {op.path}")
             old = target.read_text(errors="replace")
             target.unlink()
-            changes.append({"action": "delete", "path": op.path})
+            changes.append({"action": "delete", "path": str(target)})
             diffs.append(_unified_diff(old, "", f"a/{op.path}", f"b/{op.path}"))
             continue
 
@@ -1897,15 +1904,15 @@ def execute_apply_patch(patch_text: str, cwd: Path) -> dict[str, Any]:
                 raise ValueError(f"Cannot update missing file: {op.path}")
             old = target.read_text(errors="replace")
             new = apply_hunks_to_text(old, op.hunks, op.path)
-            write_target = cwd / (op.move_to or op.path)
+            write_target = resolve_patch_path(cwd, op.move_to or op.path)
             write_target.parent.mkdir(parents=True, exist_ok=True)
             write_target.write_text(new)
             if op.move_to and write_target.resolve() != target.resolve():
                 target.unlink()
             changes.append({
                 "action": "update",
-                "path": op.path,
-                "move_to": op.move_to,
+                "path": str(target),
+                "move_to": str(write_target) if op.move_to else None,
             })
             diffs.append(
                 _unified_diff(
@@ -2092,6 +2099,29 @@ def self_test_apply_patch_roundtrip() -> None:
         _assert_equal(target.read_text(), "alpha\ngamma\n")
 
 
+def self_test_apply_patch_absolute_paths() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        target = cwd / "absolute.txt"
+        target.write_text("alpha\nbeta\n")
+        result = execute_apply_patch(
+            "\n".join(
+                [
+                    "*** Begin Patch",
+                    f"*** Update File: {target}",
+                    "@@",
+                    " alpha",
+                    "-beta",
+                    "+gamma",
+                    "*** End Patch",
+                ]
+            ),
+            cwd,
+        )
+        _assert_true(result["success"], "apply_patch should accept absolute paths")
+        _assert_equal(target.read_text(), "alpha\ngamma\n")
+
+
 def self_test_validate_fetch_url() -> None:
     validate_fetch_url("https://example.com/test")
     validate_fetch_url("http://localhost:8080/test")
@@ -2158,6 +2188,7 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("normalize_session_id", self_test_normalize_session_id),
     SelfTestCase("parse_tool_call_arguments", self_test_parse_tool_call_arguments),
     SelfTestCase("apply_patch_roundtrip", self_test_apply_patch_roundtrip),
+    SelfTestCase("apply_patch_absolute_paths", self_test_apply_patch_absolute_paths),
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
     SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
     SelfTestCase("copilot_headers", self_test_copilot_headers),
