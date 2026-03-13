@@ -756,6 +756,8 @@ def model_supports_endpoint(endpoint: str, model: str, provider: str = "copilot"
     supported_endpoints = entry.get("supported_endpoints") if isinstance(entry, dict) else None
     if not isinstance(supported_endpoints, list):
         return False
+    if not supported_endpoints:
+        return True
     normalized_endpoint = endpoint.strip().lower()
     return any(
         isinstance(candidate, str) and candidate.strip().lower() == normalized_endpoint
@@ -2303,6 +2305,11 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
             "version": "claude-messages-only",
             "supported_endpoints": ["/v1/messages"],
         },
+        {
+            "id": "claude-unspecified-endpoints",
+            "version": "claude-unspecified-endpoints",
+            "supported_endpoints": [],
+        },
     ]
     COPILOT_MODELS_CACHE_EXPIRES_AT = time.time() + MODELS_CACHE_TTL_SECONDS
 
@@ -2325,6 +2332,13 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
 
         unchanged = apply_copilot_ephemeral_cache(messages, provider="copilot", model="claude-messages-only")
         _assert_true(unchanged is messages, "messages-only models should not be patched")
+
+        unspecified = apply_copilot_ephemeral_cache(
+            messages,
+            provider="copilot",
+            model="claude-unspecified-endpoints",
+        )
+        _assert_true(unspecified is not messages, "empty supported_endpoints should allow patching")
 
         wrong_provider = apply_copilot_ephemeral_cache(messages, provider="openai", model="claude-chat")
         _assert_true(wrong_provider is messages, "non-copilot providers should not be patched")
