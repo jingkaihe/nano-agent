@@ -207,15 +207,30 @@ class ChatUI:
         rows: list[tuple[str, str]] = [("Tool", name)]
         rows.append(("Status", "ok" if result.get("success") else "error"))
 
-        if not result.get("success"):
-            rows.append(("Error", str(result.get("error") or "unknown error")))
-            return rows
-
         if name == "bash":
-            rows.append(("Command", str(result.get("command") or "")))
-            rows.append(("Exit code", str(result.get("exit_code") or 0)))
+            command = str(result.get("command") or "")
+            if command:
+                rows.append(("Command", command))
+
+            exit_code = result.get("exit_code")
+            if exit_code is not None:
+                rows.append(("Exit code", str(exit_code)))
+
             if result.get("truncated"):
                 rows.append(("Output", f"truncated to {MAX_TOOL_OUTPUT_BYTES} bytes"))
+
+            if not result.get("success"):
+                output = str(result.get("output") or "")
+                error = str(result.get("error") or "")
+                if not output:
+                    if error:
+                        rows.append(("Error", error))
+                    elif exit_code is not None:
+                        rows.append(("Error", f"command exited with code {exit_code}"))
+            return rows
+
+        if not result.get("success"):
+            rows.append(("Error", str(result.get("error") or "unknown error")))
             return rows
 
         if name == "apply_patch":
@@ -253,6 +268,23 @@ class ChatUI:
     def _tool_preview(
         self, name: str, result: dict[str, Any]
     ) -> tuple[str, str] | None:
+        if name == "bash":
+            output = str(result.get("output") or "")
+            if output:
+                return ("Output", self._preview_text(output))
+
+            if not result.get("success"):
+                error = str(result.get("error") or "")
+                if not error and result.get("exit_code") is not None:
+                    error = f"command exited with code {result['exit_code']}"
+                return (
+                    ("Error", self._preview_text(error, max_lines=8, max_chars=1200))
+                    if error
+                    else None
+                )
+
+            return None
+
         if not result.get("success"):
             error = str(result.get("error") or "")
             return (
@@ -260,10 +292,6 @@ class ChatUI:
                 if error
                 else None
             )
-
-        if name == "bash":
-            output = str(result.get("output") or "")
-            return ("Output", self._preview_text(output)) if output else None
 
         if name == "apply_patch":
             diff = str(result.get("diff") or "")
@@ -2861,6 +2889,35 @@ def self_test_truncate_tool_output() -> None:
     )
 
 
+def self_test_bash_failure_preview_uses_output() -> None:
+    ui = ChatUI()
+    result = {
+        "success": False,
+        "command": "ls /definitely-missing",
+        "exit_code": 2,
+        "output": "ls: cannot access '/definitely-missing': No such file or directory",
+        "truncated": False,
+    }
+
+    rows = ui._tool_metadata_rows("bash", result)
+    _assert_equal(
+        rows,
+        [
+            ("Tool", "bash"),
+            ("Status", "error"),
+            ("Command", "ls /definitely-missing"),
+            ("Exit code", "2"),
+        ],
+    )
+    _assert_equal(
+        ui._tool_preview("bash", result),
+        (
+            "Output",
+            "ls: cannot access '/definitely-missing': No such file or directory",
+        ),
+    )
+
+
 def self_test_build_system_prompt_variants() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
@@ -2915,6 +2972,9 @@ SELF_TESTS: list[SelfTestCase] = [
     ),
     SelfTestCase("models_cache_roundtrip", self_test_models_cache_roundtrip),
     SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
+    SelfTestCase(
+        "bash_failure_preview_uses_output", self_test_bash_failure_preview_uses_output
+    ),
     SelfTestCase(
         "build_system_prompt_variants", self_test_build_system_prompt_variants
     ),
