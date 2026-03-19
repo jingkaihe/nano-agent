@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import inspect
 import json
 import os
 import platform
@@ -33,8 +34,10 @@ from pathlib import Path
 from typing import Any, Callable, cast
 from urllib.parse import urljoin, urlparse
 
+import anthropic
 import click
 import httpx
+import openai
 import yaml
 from anthropic import AsyncAnthropic
 from click.core import ParameterSource
@@ -665,10 +668,12 @@ def save_copilot_credentials(
     return path
 
 
-def refresh_copilot_token(creds: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def refresh_copilot_token(
+    creds: dict[str, Any], *, force: bool = False
+) -> tuple[str, dict[str, Any]]:
     refresh_threshold = time.time() + 10 * 60
     expires_at = _coerce_expires_at(creds["copilot_expires_at"])
-    if expires_at > refresh_threshold:
+    if not force and expires_at > refresh_threshold:
         return creds["copilot_token"], creds
 
     response = httpx.get(
@@ -682,6 +687,49 @@ def refresh_copilot_token(creds: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     creds["copilot_expires_at"] = token_data["expires_at"]
     save_copilot_credentials(creds)
     return creds["copilot_token"], creds
+
+
+async def _close_async_client(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+def _copilot_auth_error_status(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    return response_status if isinstance(response_status, int) else None
+
+
+def is_copilot_auth_error(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            openai.AuthenticationError,
+            openai.PermissionDeniedError,
+            anthropic.AuthenticationError,
+            anthropic.PermissionDeniedError,
+        ),
+    ):
+        return True
+
+    if isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError)):
+        return _copilot_auth_error_status(exc) in {401, 403}
+
+    return False
+
+
+def _is_async_context_manager(value: Any) -> bool:
+    return callable(getattr(value, "__aenter__", None)) and callable(
+        getattr(value, "__aexit__", None)
+    )
 
 
 def create_openai_copilot_client() -> AsyncOpenAI:
@@ -704,15 +752,7 @@ def create_anthropic_copilot_client() -> AsyncAnthropic:
     return AsyncAnthropic(
         auth_token=copilot_token,
         base_url=copilot_base_url(),
-        default_headers={
-            "User-Agent": COPILOT_CHAT_USER_AGENT,
-            "Editor-Version": COPILOT_EDITOR_VERSION,
-            "Editor-Plugin-Version": COPILOT_CHAT_PLUGIN_VERSION,
-            "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-            "OpenAI-Intent": "conversation-panel",
-            "X-GitHub-Api-Version": COPILOT_GITHUB_API_VERSION,
-            "X-Vscode-User-Agent-Library-Version": COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
-        },
+        default_headers=copilot_anthropic_headers(),
     )
 
 
@@ -754,6 +794,18 @@ def copilot_api_headers(copilot_token: str) -> dict[str, str]:
         "OpenAI-Intent": "conversation-panel",
         "X-GitHub-Api-Version": COPILOT_GITHUB_API_VERSION,
         "X-Request-Id": str(uuid.uuid4()),
+        "X-Vscode-User-Agent-Library-Version": COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
+    }
+
+
+def copilot_anthropic_headers() -> dict[str, str]:
+    return {
+        "User-Agent": COPILOT_CHAT_USER_AGENT,
+        "Editor-Version": COPILOT_EDITOR_VERSION,
+        "Editor-Plugin-Version": COPILOT_CHAT_PLUGIN_VERSION,
+        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+        "OpenAI-Intent": "conversation-panel",
+        "X-GitHub-Api-Version": COPILOT_GITHUB_API_VERSION,
         "X-Vscode-User-Agent-Library-Version": COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
     }
 
@@ -2564,6 +2616,29 @@ class SelfTestCase:
     func: Callable[[], None]
 
 
+class _CopilotRefreshAsyncContextManager:
+    def __init__(self, agent: NanoAgent, call: Callable[[], Any], manager: Any) -> None:
+        self.agent = agent
+        self.call = call
+        self.manager = manager
+
+    async def __aenter__(self) -> Any:
+        try:
+            return await self.manager.__aenter__()
+        except Exception as exc:
+            if not _is_copilot_provider(self.agent.provider) or not is_copilot_auth_error(
+                exc
+            ):
+                raise
+
+        await self.agent._refresh_copilot_clients(force=True)
+        self.manager = await self.agent._resolve_copilot_call_result(self.call)
+        return await self.manager.__aenter__()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return await self.manager.__aexit__(exc_type, exc, tb)
+
+
 def _assert_equal(actual: Any, expected: Any, message: str = "") -> None:
     if actual != expected:
         detail = message or f"expected {expected!r}, got {actual!r}"
@@ -2918,6 +2993,205 @@ def self_test_bash_failure_preview_uses_output() -> None:
     )
 
 
+def self_test_is_copilot_auth_error() -> None:
+    auth_exc = openai.AuthenticationError(
+        "unauthorized",
+        response=httpx.Response(401, request=httpx.Request("GET", "https://example.com")),
+        body=None,
+    )
+    forbidden_exc = openai.PermissionDeniedError(
+        "forbidden",
+        response=httpx.Response(403, request=httpx.Request("GET", "https://example.com")),
+        body=None,
+    )
+    bad_request_exc = openai.APIStatusError(
+        "bad request",
+        response=httpx.Response(400, request=httpx.Request("GET", "https://example.com")),
+        body=None,
+    )
+
+    _assert_true(is_copilot_auth_error(auth_exc), "401 auth errors should be retried")
+    _assert_true(
+        is_copilot_auth_error(forbidden_exc), "403 permission errors should be retried"
+    )
+    _assert_true(
+        not is_copilot_auth_error(bad_request_exc),
+        "non-auth API errors should not be treated as refreshable",
+    )
+
+
+def self_test_refresh_copilot_token_skips_valid_token() -> None:
+    creds = {
+        "access_token": "github-token",
+        "copilot_token": "copilot-token",
+        "copilot_expires_at": time.time() + 3600,
+    }
+    token, refreshed = refresh_copilot_token(creds)
+    _assert_equal(token, "copilot-token")
+    _assert_true(refreshed is creds, "refresh should reuse provided credentials dict")
+    _assert_equal(refreshed["copilot_token"], "copilot-token")
+
+
+def self_test_refresh_copilot_token_renews_expiring_token() -> None:
+    original_get = httpx.get
+    original_save = save_copilot_credentials
+    saved_creds: list[dict[str, Any]] = []
+
+    def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+        _assert_equal(url, COPILOT_EXCHANGE_URL)
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            200,
+            json={
+                "token": "fresh-copilot-token",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+            request=request,
+        )
+
+    def fake_save(credentials: dict[str, Any], output_path: Path | None = None) -> Path:
+        saved_creds.append(dict(credentials))
+        return output_path or Path("/tmp/copilot.json")
+
+    try:
+        httpx.get = fake_get
+        globals()["save_copilot_credentials"] = fake_save
+        creds = {
+            "access_token": "github-token",
+            "copilot_token": "stale-copilot-token",
+            "copilot_expires_at": time.time() + 60,
+        }
+        token, refreshed = refresh_copilot_token(creds)
+        _assert_equal(token, "fresh-copilot-token")
+        _assert_equal(refreshed["copilot_token"], "fresh-copilot-token")
+        _assert_equal(refreshed["copilot_expires_at"], "2099-01-01T00:00:00Z")
+        _assert_equal(len(saved_creds), 1)
+        _assert_equal(saved_creds[0]["copilot_token"], "fresh-copilot-token")
+    finally:
+        httpx.get = original_get
+        globals()["save_copilot_credentials"] = original_save
+
+
+def self_test_call_with_provider_auth_retry_retries_auth_error() -> None:
+    async def _run() -> None:
+        agent = NanoAgent.__new__(NanoAgent)
+        agent.provider = "copilot"
+        agent.api_key = None
+        agent.base_url = None
+        refresh_calls: list[bool] = []
+        attempts = {"count": 0}
+
+        async def fake_refresh(*, force: bool = False) -> bool:
+            refresh_calls.append(force)
+            return True
+
+        async def fake_call() -> str:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise openai.AuthenticationError(
+                    "unauthorized",
+                    response=httpx.Response(
+                        401,
+                        request=httpx.Request("GET", "https://example.com"),
+                    ),
+                    body=None,
+                )
+            return "ok"
+
+        agent._refresh_copilot_clients = fake_refresh  # type: ignore[attr-defined]
+        result = await NanoAgent._call_with_provider_auth_retry(agent, fake_call)
+        _assert_equal(result, "ok")
+        _assert_equal(refresh_calls, [False, True])
+        _assert_equal(attempts["count"], 2)
+
+    asyncio.run(_run())
+
+
+def self_test_call_with_provider_auth_retry_retries_stream_auth_error() -> None:
+    async def _run() -> None:
+        agent = NanoAgent.__new__(NanoAgent)
+        agent.provider = "copilot"
+        agent.api_key = None
+        agent.base_url = None
+        refresh_calls: list[bool] = []
+        enter_attempts: list[str] = []
+        exit_calls: list[str] = []
+        call_count = 0
+
+        async def fake_refresh(*, force: bool = False) -> bool:
+            refresh_calls.append(force)
+            return True
+
+        class FakeStreamManager:
+            def __init__(self, name: str, *, fail_auth: bool) -> None:
+                self.name = name
+                self.fail_auth = fail_auth
+
+            async def __aenter__(self) -> str:
+                enter_attempts.append(self.name)
+                if self.fail_auth:
+                    raise openai.AuthenticationError(
+                        "unauthorized",
+                        response=httpx.Response(
+                            401,
+                            request=httpx.Request("GET", "https://example.com"),
+                        ),
+                        body=None,
+                    )
+                return f"stream:{self.name}"
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                exit_calls.append(self.name)
+                return False
+
+        def fake_call() -> FakeStreamManager:
+            nonlocal call_count
+            call_count += 1
+            return FakeStreamManager(f"attempt-{call_count}", fail_auth=call_count == 1)
+
+        agent._refresh_copilot_clients = fake_refresh  # type: ignore[attr-defined]
+        stream_cm = await NanoAgent._call_with_provider_auth_retry(agent, fake_call)
+        async with stream_cm as stream:
+            _assert_equal(stream, "stream:attempt-2")
+
+        _assert_equal(refresh_calls, [False, True])
+        _assert_equal(enter_attempts, ["attempt-1", "attempt-2"])
+        _assert_equal(exit_calls, ["attempt-2"])
+        _assert_equal(call_count, 2)
+
+    asyncio.run(_run())
+
+
+def self_test_call_with_provider_auth_retry_non_copilot_no_retry() -> None:
+    async def _run() -> None:
+        agent = NanoAgent.__new__(NanoAgent)
+        agent.provider = "openai"
+        agent.api_key = None
+        agent.base_url = None
+        attempts = {"count": 0}
+
+        async def fake_call() -> str:
+            attempts["count"] += 1
+            raise openai.AuthenticationError(
+                "unauthorized",
+                response=httpx.Response(
+                    401,
+                    request=httpx.Request("GET", "https://example.com"),
+                ),
+                body=None,
+            )
+
+        try:
+            await NanoAgent._call_with_provider_auth_retry(agent, fake_call)
+        except openai.AuthenticationError:
+            pass
+        else:
+            raise AssertionError("non-copilot auth errors should not be retried")
+        _assert_equal(attempts["count"], 1)
+
+    asyncio.run(_run())
+
+
 def self_test_build_system_prompt_variants() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
@@ -2974,6 +3248,27 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
     SelfTestCase(
         "bash_failure_preview_uses_output", self_test_bash_failure_preview_uses_output
+    ),
+    SelfTestCase("is_copilot_auth_error", self_test_is_copilot_auth_error),
+    SelfTestCase(
+        "refresh_copilot_token_skips_valid_token",
+        self_test_refresh_copilot_token_skips_valid_token,
+    ),
+    SelfTestCase(
+        "refresh_copilot_token_renews_expiring_token",
+        self_test_refresh_copilot_token_renews_expiring_token,
+    ),
+    SelfTestCase(
+        "call_with_provider_auth_retry_retries_auth_error",
+        self_test_call_with_provider_auth_retry_retries_auth_error,
+    ),
+    SelfTestCase(
+        "call_with_provider_auth_retry_retries_stream_auth_error",
+        self_test_call_with_provider_auth_retry_retries_stream_auth_error,
+    ),
+    SelfTestCase(
+        "call_with_provider_auth_retry_non_copilot_no_retry",
+        self_test_call_with_provider_auth_retry_non_copilot_no_retry,
     ),
     SelfTestCase(
         "build_system_prompt_variants", self_test_build_system_prompt_variants
@@ -3063,9 +3358,16 @@ class NanoAgent:
                 self.created_at = cast(str, existing["created_at"])
             except Exception:
                 pass
+        self.api_key = api_key
+        self.base_url = base_url
+        self._copilot_token: str | None = None
         self.client = create_client(
             provider=provider, api_key=api_key, base_url=base_url
         )
+        if _is_copilot_provider(provider) and api_key is None and base_url is None:
+            creds = load_copilot_credentials()
+            copilot_token, _ = refresh_copilot_token(creds)
+            self._copilot_token = copilot_token
         self.anthropic_client = (
             create_anthropic_copilot_client()
             if should_use_anthropic_messages_api(provider, model)
@@ -3123,9 +3425,82 @@ class NanoAgent:
     def system_prompt(self) -> str:
         return build_system_prompt(self.cwd, self.model)
 
-    def close(self) -> None:
+    def require_anthropic_client(self) -> AsyncAnthropic:
+        if self.anthropic_client is None:
+            raise ValueError("Anthropic messages client is not configured")
+        return self.anthropic_client
+
+    async def _refresh_copilot_clients(self, *, force: bool = False) -> bool:
+        if (
+            not _is_copilot_provider(self.provider)
+            or self.api_key is not None
+            or self.base_url is not None
+        ):
+            return False
+
+        creds = load_copilot_credentials()
+        previous_token = str(creds.get("copilot_token") or self._copilot_token or "")
+        copilot_token, refreshed = refresh_copilot_token(creds, force=force)
+        token_changed = force or copilot_token != previous_token
+        self._copilot_token = copilot_token
+        if not token_changed:
+            return False
+
+        old_client = self.client
+        old_anthropic_client = self.anthropic_client
+        self.client = AsyncOpenAI(
+            api_key=copilot_token,
+            base_url=copilot_base_url(),
+            default_headers={
+                "User-Agent": COPILOT_OPENAI_USER_AGENT,
+                "Editor-Version": COPILOT_EDITOR_VERSION,
+            },
+        )
+        self.anthropic_client = (
+            AsyncAnthropic(
+                auth_token=copilot_token,
+                base_url=copilot_base_url(),
+                default_headers=copilot_anthropic_headers(),
+            )
+            if should_use_anthropic_messages_api(self.provider, self.model)
+            else None
+        )
+
+        if old_client is not self.client:
+            await _close_async_client(old_client)
+        if old_anthropic_client is not None and old_anthropic_client is not self.anthropic_client:
+            await _close_async_client(old_anthropic_client)
+        return refreshed.get("copilot_token") != previous_token or force
+
+    async def _resolve_copilot_call_result(self, call: Callable[[], Any]) -> Any:
+        result = call()
+        return await result if inspect.isawaitable(result) else result
+
+    async def _call_with_provider_auth_retry(self, call: Callable[[], Any]) -> Any:
+        if _is_copilot_provider(self.provider):
+            await self._refresh_copilot_clients()
+
+        try:
+            result = await self._resolve_copilot_call_result(call)
+            if _is_async_context_manager(result):
+                return _CopilotRefreshAsyncContextManager(self, call, result)
+            return result
+        except Exception as exc:
+            if not _is_copilot_provider(self.provider) or not is_copilot_auth_error(exc):
+                raise
+
+            await self._refresh_copilot_clients(force=True)
+            retry_result = await self._resolve_copilot_call_result(call)
+            if _is_async_context_manager(retry_result):
+                return _CopilotRefreshAsyncContextManager(self, call, retry_result)
+            return retry_result
+
+    async def close(self) -> None:
         self.save_history()
         self.bash.close()
+        await _close_async_client(self.client)
+        if self.anthropic_client is not None:
+            await _close_async_client(self.anthropic_client)
 
     def serialized_history(self) -> dict[str, Any]:
         return {
@@ -3316,7 +3691,9 @@ class NanoAgent:
             reasoning = self.responses_reasoning()
             if reasoning:
                 kwargs["reasoning"] = reasoning
-            response = await self.client.responses.create(**kwargs)
+            response = await self._call_with_provider_auth_retry(
+                lambda: self.client.responses.create(**kwargs)
+            )
             self.record_usage(
                 getattr(response, "usage", None),
                 api="responses",
@@ -3337,9 +3714,9 @@ class NanoAgent:
                         fragments.append(content_item["text"])
             return "".join(fragments)
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=self.prepare_chat_messages(
+        chat_messages = cast(
+            list[ChatCompletionMessageParam],
+            self.prepare_chat_messages(
                 [
                     {
                         "role": "system",
@@ -3351,8 +3728,14 @@ class NanoAgent:
                     },
                 ]
             ),
-            extra_body=self.chat_extra_body(),
-            **self.completion_kwargs(),
+        )
+        response = await self._call_with_provider_auth_retry(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=chat_messages,
+                extra_body=self.chat_extra_body(),
+                **self.completion_kwargs(),
+            )
         )
         self.record_usage(
             getattr(response, "usage", None),
@@ -3379,7 +3762,10 @@ class NanoAgent:
             if reasoning:
                 kwargs["reasoning"] = reasoning
 
-            async with self.client.responses.stream(**kwargs) as stream:
+            stream_cm = await self._call_with_provider_auth_retry(
+                lambda: self.client.responses.stream(**kwargs)
+            )
+            async with stream_cm as stream:
                 async for event in stream:
                     event_type = getattr(event, "type", None)
                     if event_type == "response.output_text.delta":
@@ -3432,15 +3818,17 @@ class NanoAgent:
             )
             chat_tools = cast(list[ChatCompletionToolParam], self.tool_specs())
 
-            stream = await self.client.chat.completions.create(
-                model=self.model,
-                messages=chat_messages,
-                tools=chat_tools,
-                tool_choice="auto",
-                stream=True,
-                stream_options={"include_usage": True},
-                extra_body=self.chat_extra_body(),
-                **self.completion_kwargs(),
+            stream = await self._call_with_provider_auth_retry(
+                lambda: self.client.chat.completions.create(
+                    model=self.model,
+                    messages=chat_messages,
+                    tools=chat_tools,
+                    tool_choice="auto",
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    extra_body=self.chat_extra_body(),
+                    **self.completion_kwargs(),
+                )
             )
 
             final_usage: Any = None
@@ -3527,7 +3915,10 @@ class NanoAgent:
             if thinking is not None:
                 kwargs["thinking"] = thinking
 
-            async with self.anthropic_client.messages.stream(**kwargs) as stream:
+            stream_cm = await self._call_with_provider_auth_retry(
+                lambda: self.require_anthropic_client().messages.stream(**kwargs)
+            )
+            async with stream_cm as stream:
                 async for event in stream:
                     event_type = getattr(event, "type", None)
                     if event_type == "content_block_delta":
@@ -3742,7 +4133,7 @@ async def run_chat(
     finally:
         agent.ui.show_usage_summary(agent.usage, agent.model, agent.provider)
         agent.ui.show_session_exit(agent.session_id)
-        agent.close()
+        await agent.close()
 
 
 @click.group(
