@@ -24,8 +24,10 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,7 +42,6 @@ import httpx
 import openai
 import yaml
 from anthropic import AsyncAnthropic
-from click.core import ParameterSource
 from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
@@ -76,8 +77,39 @@ ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
 HISTORY_DIR = Path.home() / ".nano-agent" / "history"
 MODELS_CACHE_TTL_SECONDS = 300
 JINJA = Environment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
+MAX_READ_OUTPUT_BYTES = 100_000
+MAX_READ_LINE_CHARACTERS = 2000
+MAX_READ_LINE_LIMIT = 2000
+GREP_MAX_RESULTS = 100
+GREP_MAX_LINE_LENGTH = 300
+GREP_MAX_OUTPUT_BYTES = 50 * 1024
+GLOB_MAX_RESULTS = 100
+SEARCH_TOOL_TIMEOUT_SECONDS = 60
 COPILOT_MODELS_CACHE: list[dict[str, Any]] | None = None
 COPILOT_MODELS_CACHE_EXPIRES_AT: float | None = None
+
+ALL_TOOL_NAMES = (
+    "bash",
+    "apply_patch",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "grep",
+    "glob",
+    "skill",
+    "web_fetch",
+)
+DEFAULT_RESPONSE_TOOL_NAMES = ["bash", "apply_patch", "skill", "web_fetch"]
+DEFAULT_CHAT_TOOL_NAMES = [
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "grep",
+    "glob",
+    "skill",
+    "web_fetch",
+]
 
 
 class CopilotAuthError(Exception):
@@ -148,6 +180,9 @@ class ChatUI:
     def show_user(self, text: str) -> None:
         self._separator("user", "green")
         self.console.print(text, soft_wrap=True)
+
+    def show_debug(self, text: str) -> None:
+        self.console.print(f"[dim][debug][/dim] {text}")
 
     def begin_assistant(self) -> None:
         self._current_stream = None
@@ -236,6 +271,26 @@ class ChatUI:
             rows.append(("Error", str(result.get("error") or "unknown error")))
             return rows
 
+        if name in {"read_file", "write_file", "edit_file"}:
+            rows.append(("Path", str(result.get("file_path") or "")))
+            if name == "read_file":
+                rows.append(("Offset", str(result.get("offset") or 1)))
+                rows.append(("Line limit", str(result.get("line_limit") or "")))
+            if name == "edit_file" and result.get("replace_all"):
+                rows.append(("Replaced", str(result.get("replaced_count") or 0)))
+            return rows
+
+        if name in {"grep", "glob"}:
+            if result.get("path"):
+                rows.append(("Path", str(result.get("path") or "")))
+            if name == "grep":
+                rows.append(("Pattern", str(result.get("pattern") or "")))
+            else:
+                rows.append(("Pattern", str(result.get("pattern") or "")))
+            if result.get("truncated"):
+                rows.append(("Output", "truncated"))
+            return rows
+
         if name == "apply_patch":
             rows.append(("Summary", str(result.get("summary") or "")))
             changes = (
@@ -304,7 +359,7 @@ class ChatUI:
                 else None
             )
 
-        if name in {"web_fetch", "skill"}:
+        if name in {"read_file", "write_file", "edit_file", "grep", "glob", "web_fetch", "skill"}:
             content = str(result.get("content") or "")
             return (
                 ("Preview", self._preview_text(content, max_lines=16, max_chars=3000))
@@ -445,6 +500,7 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
     model = data.get("model")
     provider = data.get("provider")
     reasoning_effort = data.get("reasoning_effort")
+    allowed_tools = normalize_allowed_tools(data.get("allowed_tools"))
     raw_history = data.get("history")
     history: dict[str, Any] = raw_history if isinstance(raw_history, dict) else {}
     messages = history.get("messages", data.get("messages", []))
@@ -486,6 +542,7 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
         "model": model,
         "provider": provider,
         "reasoning_effort": reasoning_effort,
+        "allowed_tools": allowed_tools,
         "created_at": created_at,
         "updated_at": updated_at,
         "messages": messages,
@@ -1204,7 +1261,11 @@ def _is_gpt_41_model(model: str | None) -> bool:
     return normalized == "gpt-4.1" or normalized.startswith("gpt-4.1-")
 
 
-def _default_system_instructions() -> str:
+def _default_system_instructions(
+    model: str | None = None,
+    provider: str = DEFAULT_PROVIDER,
+    allowed_tools: list[str] | None = None,
+) -> str:
     return """You are an interactive CLI tool that helps with software engineering and production operations tasks. Please follows the instructions and tools below to help the user.
 
 # Tone and Style
@@ -1221,11 +1282,14 @@ You only need to be proactive when the user explicitly requests you to do so. Ge
 * Doing exactly what the user asks for, and make sure that you follow through the actions to fullfill the request.
 * Not surprising the user with additional activities without consent from the user.
 
-# Filesystem Search Tools
-For filesystem search activities, use `fd` for file discovery and `rg` for content search via the `bash` tool only."""
+""" + "\n\n# Tooling Guidance\n" + tool_guidance_text(model or DEFAULT_MODEL, provider, allowed_tools)
 
 
-def _gpt_41_system_instructions() -> str:
+def _gpt_41_system_instructions(
+    model: str | None = None,
+    provider: str = DEFAULT_PROVIDER,
+    allowed_tools: list[str] | None = None,
+) -> str:
     return """You are an agent - please keep going until the user’s query is completely resolved, before ending your turn and yielding back to the user.
 
 Your thinking should be thorough and so it's fine if it's very long. However, avoid unnecessary repetition and verbosity. You should be concise, but thorough.
@@ -1306,7 +1370,7 @@ Carefully read the issue and think hard about a plan to solve it before coding.
 ## 6. Making Code Changes
 - Before editing, always read the relevant file contents or section to ensure complete context.
 - Use `bash` for shell commands, inspection, repo navigation, and test execution. For filesystem search, use `fd` for file discovery and `rg` for content search via `bash`.
-- Use `apply_patch` for file edits.
+- Use `read_file`, `write_file`, and `edit_file` for file changes when those tools are available; otherwise use `apply_patch`.
 - Use `skill` when a matching skill is relevant; if a listed skill clearly applies, invoke it before other work.
 - If a patch is not applied correctly, attempt to reapply it.
 - Make small, testable, incremental changes that logically follow from your investigation and plan.
@@ -1360,15 +1424,20 @@ Remember that todo lists must always be written in markdown format and must alwa
 If the user tells you to stage and commit, you may do so.
 
 You are NEVER allowed to stage and commit files automatically.
-"""
+""" + "\n\n# Tooling Guidance\n" + tool_guidance_text(model or DEFAULT_MODEL, provider, allowed_tools)
 
 
-def build_system_prompt(cwd: Path, model: str | None = None) -> str:
+def build_system_prompt(
+    cwd: Path,
+    model: str | None = None,
+    provider: str = DEFAULT_PROVIDER,
+    allowed_tools: list[str] | None = None,
+) -> str:
     contexts = collect_contexts(cwd)
     instructions = (
-        _gpt_41_system_instructions()
+        _gpt_41_system_instructions(model, provider, allowed_tools)
         if _is_gpt_41_model(model)
-        else _default_system_instructions()
+        else _default_system_instructions(model, provider, allowed_tools)
     )
     template = JINJA.from_string(
         """{{ instructions }}
@@ -1574,7 +1643,7 @@ def skill_description(skills: dict[str, SkillInfo]) -> str:
 - Do not invoke a skill that is already running
 - Each skill has a directory containing supporting files (references, examples, scripts, templates) that you can inspect using fd/rg/sed/cat via bash
 - Do NOT modify any files in the skill directory - treat skill contents as read-only
-- If you need to modify a script or template from the skill directory, copy it to the working directory first and update it using apply_patch
+- If you need to modify a script or template from the skill directory, copy it to the working directory first and update it using write_file / edit_file / apply_patch as appropriate
 - For Python scripts, use uv for managing dependencies, preferably uv with inline metadata dependencies if the script to run is a single file - do NOT install packages using system pip
 
 ## Available Skills
@@ -1594,7 +1663,13 @@ Skills are currently not available.
     return template.render(skills=[skills[name] for name in sorted(skills)]).rstrip()
 
 
-def bash_description() -> str:
+def bash_description(tool_names: list[str] | None = None) -> str:
+    available = set(tool_names or [])
+    edit_hint = (
+        "write_file or edit_file"
+        if {"write_file", "edit_file"}.issubset(available)
+        else "apply_patch"
+    )
     return JINJA.from_string(
         """Run a bash command in an isolated shell process.
 
@@ -1616,11 +1691,110 @@ Banned commands:
 - Do not run interactive commands.
 - For multiple commands, use ';' or '&&' on one line.
 - Avoid direct cd; use absolute paths or subshell: (cd /path && cmd).
-- For filesystem search activities, use fd and rg via this tool only.
-- Do not use heredoc; use file_write or apply_patch instead.
+- {% if prefer_search_tools %}Prefer grep/glob over grep/find in bash.{% else %}For filesystem search activities, use fd and rg via this tool only.{% endif %}
+- Do not use heredoc; use {{ edit_hint }} instead.
 
 Examples:
 - (cd /repo && mise run test)
+"""
+    ).render(prefer_search_tools={"grep", "glob"}.issubset(available), edit_hint=edit_hint)
+
+
+def read_file_description() -> str:
+    return JINJA.from_string(
+        f"""Reads a file and returns its contents with line numbers.
+
+This tool takes three parameters:
+- file_path: The absolute path of the file to read
+- offset: The 1-indexed line number to start reading from (default: 1, minimum: 1)
+- line_limit: The maximum number of lines to read from the offset (default: {MAX_READ_LINE_LIMIT}, minimum: 1, maximum: {MAX_READ_LINE_LIMIT})
+
+For most files, omit offset and line_limit to read the entire file. Use these parameters only for large files when you need specific sections.
+
+The result includes line numbers. If there are more lines beyond the line limit, a continuation hint is shown. Very long lines are truncated and total output is capped at {MAX_READ_OUTPUT_BYTES} bytes.
+
+If you need to read multiple files, use parallel tool calling to read multiple files simultaneously.
+"""
+    ).render()
+
+
+def write_file_description() -> str:
+    return JINJA.from_string(
+        """Writes a file with the given text. If the file already exists, its contents will be overwritten.
+
+This tool takes two parameters:
+- file_path: The absolute path of the file to write
+- text: The text to be written to the file. It must not be empty.
+
+IMPORTANT: If you want to create an empty file, use the `bash` tool to run `touch` instead.
+IMPORTANT: If you are overwriting an existing file, read it using `read_file` first. If the file changed after the last read, this tool will ask you to read it again.
+IMPORTANT: Make sure the directory already exists before writing to it.
+"""
+    ).render()
+
+
+def edit_file_description() -> str:
+    return JINJA.from_string(
+        """Edit a file by replacing old text with new text.
+
+If you are creating a new file, use `write_file` instead.
+
+This tool takes four parameters:
+- file_path: The absolute path of the file to edit
+- old_text: The text to be replaced. It must exactly match the text in the file including whitespace.
+- new_text: The replacement text
+- replace_all: Optional, default false. If true, replace all occurrences of old_text; otherwise old_text must be unique.
+
+# RULES
+## Read before editing
+You must read the file using `read_file` before making non-replace_all edits.
+
+## Unique matching
+When replace_all is false, make old_text unique by including 3-5 lines before and after the target block where needed.
+
+## Validate after edit
+If the edit changes code or configuration, validate it with the relevant checks via `bash`.
+"""
+    ).render()
+
+
+def grep_description() -> str:
+    return JINJA.from_string(
+        f"""Search for a pattern in the codebase using regex.
+
+## Important Notes
+* Prefer this tool over raw grep/egrep shell commands for content search.
+* Files matching .gitignore patterns are automatically excluded by the underlying rg defaults.
+* Hidden files/directories (starting with .) are skipped by default for directory searches.
+* Results are sorted by modification time (newest first), returning at most {GREP_MAX_RESULTS} files by default.
+* To get the best result, use `glob` first to narrow the files and then use this tool for targeted content search.
+
+## Input
+- pattern: The pattern to search for (regex by default, or literal string if fixed_strings is true)
+- path: The absolute path to search in. Can be a directory or a single file. Defaults to the current working directory.
+- include: Optional glob pattern to filter files, for example `*.go` or `*.{{go,py}}`
+- ignore_case: If true, use case-insensitive search
+- fixed_strings: If true, treat pattern as a literal string instead of regex
+- surround_lines: Number of lines of context to show before and after each match
+- max_results: Number of files to return results from (1-{GREP_MAX_RESULTS})
+"""
+    ).render()
+
+
+def glob_description() -> str:
+    return JINJA.from_string(
+        f"""Find files matching a glob pattern in the filesystem.
+
+## Important Notes
+* By default, .gitignore patterns are respected.
+* Hidden files/directories (starting with .) are excluded by default.
+* Results return at most {GLOB_MAX_RESULTS} files sorted by modification time (newest first).
+* This tool matches filenames, not file contents. For content search, use `grep`.
+
+## Input
+- pattern: The glob pattern to match files, for example `*.go`, `**/*.py`, or `cmd/*.ts`
+- path: The absolute path to a directory to search in. Defaults to the current working directory.
+- ignore_gitignore: If true, do not respect .gitignore rules.
 """
     ).render()
 
@@ -1762,6 +1936,132 @@ def bash_schema() -> dict[str, Any]:
             },
         },
         "required": ["command", "description", "timeout"],
+        "additionalProperties": False,
+    }
+
+
+def read_file_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "The absolute path of the file to read",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "The 1-indexed line number to start reading from. Default: 1",
+            },
+            "line_limit": {
+                "type": "integer",
+                "description": f"The maximum number of lines to read from the offset. Default: {MAX_READ_LINE_LIMIT}. Max: {MAX_READ_LINE_LIMIT}",
+            },
+        },
+        "required": ["file_path"],
+        "additionalProperties": False,
+    }
+
+
+def write_file_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "The absolute path of the file to write",
+            },
+            "text": {
+                "type": "string",
+                "description": "The text to write to the file",
+            },
+        },
+        "required": ["file_path", "text"],
+        "additionalProperties": False,
+    }
+
+
+def edit_file_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "The absolute path of the file to edit",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "The text to be replaced",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "The text to replace the old text with",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "If true, replace all occurrences of old_text; otherwise old_text must be unique",
+            },
+        },
+        "required": ["file_path", "old_text", "new_text"],
+        "additionalProperties": False,
+    }
+
+
+def grep_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "The pattern to search for",
+            },
+            "path": {
+                "type": "string",
+                "description": "Absolute file or directory path to search in",
+            },
+            "include": {
+                "type": "string",
+                "description": "Optional glob to filter files when searching a directory",
+            },
+            "ignore_case": {
+                "type": "boolean",
+                "description": "Case-insensitive search if true",
+            },
+            "fixed_strings": {
+                "type": "boolean",
+                "description": "Treat pattern as a literal string if true",
+            },
+            "surround_lines": {
+                "type": "integer",
+                "description": "Number of context lines before and after each match",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": f"Maximum number of files to return. Max: {GREP_MAX_RESULTS}",
+            },
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+
+def glob_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "The glob pattern to match files",
+            },
+            "path": {
+                "type": "string",
+                "description": "Absolute directory path to search in",
+            },
+            "ignore_gitignore": {
+                "type": "boolean",
+                "description": "If true, do not respect .gitignore rules",
+            },
+        },
+        "required": ["pattern"],
         "additionalProperties": False,
     }
 
@@ -2595,6 +2895,413 @@ def add_line_numbers(text: str, max_lines: int = 400, max_chars: int = 30000) ->
     return numbered
 
 
+def with_numbered_lines(lines: list[str], start_line: int) -> str:
+    if not lines:
+        return ""
+    width = max(4, len(str(start_line + len(lines) - 1)))
+    return "\n".join(
+        f"{start_line + index:>{width}} | {line}"
+        for index, line in enumerate(lines)
+    )
+
+
+def normalize_allowed_tools(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+
+    items: list[str]
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = [str(part).strip() for part in value]
+    else:
+        raise ValueError("allowed_tools must be a comma-separated string or list")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not item:
+            continue
+        if item not in ALL_TOOL_NAMES:
+            available = ", ".join(ALL_TOOL_NAMES)
+            raise ValueError(f"unknown tool: {item}. Available tools: {available}")
+        if item not in seen:
+            seen.add(item)
+            normalized.append(item)
+    return normalized
+
+
+def select_tool_names(
+    model: str, provider: str, allowed_tools: list[str] | None = None
+) -> list[str]:
+    if allowed_tools is not None:
+        return list(allowed_tools)
+    if should_use_anthropic_messages_api(provider, model):
+        return list(DEFAULT_CHAT_TOOL_NAMES)
+    if should_use_responses_api(model):
+        return list(DEFAULT_RESPONSE_TOOL_NAMES)
+    return list(DEFAULT_CHAT_TOOL_NAMES)
+
+
+def tool_guidance_text(
+    model: str, provider: str, allowed_tools: list[str] | None = None
+) -> str:
+    tool_names = set(select_tool_names(model, provider, allowed_tools))
+    search_text = (
+        "For filesystem search activities, prefer the `glob` and `grep` tools."
+        if {"grep", "glob"}.issubset(tool_names)
+        else "For filesystem search activities, use `fd` for file discovery and `rg` for content search via the `bash` tool only."
+    )
+    edit_text = (
+        "Use `read_file`, `write_file`, and `edit_file` for file changes instead of `apply_patch`."
+        if {"read_file", "write_file", "edit_file"}.issubset(tool_names)
+        else "Use `apply_patch` for file edits."
+    )
+    return f"{search_text}\n{edit_text}"
+
+
+def _ensure_absolute_path(cwd: Path, raw_path: str, *, field_name: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(f"{field_name} is required")
+    path = Path(raw_path.strip())
+    if not path.is_absolute():
+        raise ValueError(f"{field_name} must be an absolute path")
+    return path.resolve()
+
+
+def _file_mtime(path: Path) -> float:
+    return path.stat().st_mtime_ns / 1_000_000_000
+
+
+def _truncate_line_for_read(line: str) -> str:
+    if len(line) <= MAX_READ_LINE_CHARACTERS:
+        return line
+    return line[:MAX_READ_LINE_CHARACTERS] + "..."
+
+
+def execute_read_file(
+    file_path: str,
+    cwd: Path,
+    *,
+    offset: int = 1,
+    line_limit: int = MAX_READ_LINE_LIMIT,
+) -> dict[str, Any]:
+    path = _ensure_absolute_path(cwd, file_path, field_name="file_path")
+    if offset < 0:
+        raise ValueError("offset must be a positive integer")
+    if line_limit == 0:
+        line_limit = MAX_READ_LINE_LIMIT
+    if line_limit < 0:
+        raise ValueError("line_limit must be a positive integer")
+    if line_limit > MAX_READ_LINE_LIMIT:
+        raise ValueError(f"line_limit cannot exceed {MAX_READ_LINE_LIMIT}")
+
+    start_line = 1 if offset == 0 else offset
+    lines = path.read_text(errors="replace").splitlines()
+    total_lines = len(lines)
+    if start_line > total_lines and start_line != 1:
+        raise ValueError(
+            f"File has only {total_lines} lines, which is less than the requested offset {start_line}"
+        )
+
+    selected: list[str] = []
+    bytes_read = 0
+    end_index = min(total_lines, start_line - 1 + line_limit)
+    current_index = start_line - 1
+    while current_index < end_index:
+        line = _truncate_line_for_read(lines[current_index])
+        line_bytes = len(line.encode("utf-8"))
+        if bytes_read + line_bytes > MAX_READ_OUTPUT_BYTES:
+            break
+        selected.append(line)
+        bytes_read += line_bytes
+        current_index += 1
+
+    remaining_lines = total_lines - current_index
+    if current_index < end_index and remaining_lines > 0:
+        selected.append(
+            f"... [truncated due to max output bytes limit of {MAX_READ_OUTPUT_BYTES}]"
+        )
+    elif current_index == end_index and remaining_lines > 0:
+        selected.append(
+            f"... [{remaining_lines} lines remaining - use offset={current_index + 1} to continue reading]"
+        )
+
+    return {
+        "success": True,
+        "file_path": str(path),
+        "offset": start_line,
+        "line_limit": line_limit,
+        "remaining_lines": max(remaining_lines, 0),
+        "content": with_numbered_lines(selected, start_line),
+    }
+
+
+def execute_write_file(
+    file_path: str,
+    text: str,
+    cwd: Path,
+    *,
+    last_read_time: float | None,
+) -> dict[str, Any]:
+    path = _ensure_absolute_path(cwd, file_path, field_name="file_path")
+    if not isinstance(text, str) or text == "":
+        raise ValueError("text is required. run 'touch' command to create an empty file")
+    if path.exists() and last_read_time is not None and _file_mtime(path) > last_read_time:
+        raise ValueError(
+            f"file {path} has been modified since the last read either by another tool or by the user, please read the file again"
+        )
+    path.write_text(text)
+    preview_lines = text.splitlines()
+    return {
+        "success": True,
+        "file_path": str(path),
+        "content": f"file {path} has been written successfully\n\n{with_numbered_lines(preview_lines, 0)}" if preview_lines else f"file {path} has been written successfully",
+    }
+
+
+def _find_line_numbers(content: str, old_text: str) -> tuple[int, int]:
+    lines = content.split("\n")
+    old_lines = old_text.split("\n")
+    for index in range(0, max(0, len(lines) - len(old_lines)) + 1):
+        if lines[index : index + len(old_lines)] == old_lines:
+            start_line = index + 1
+            return start_line, start_line + len(old_lines) - 1
+    before = content.split(old_text, 1)[0]
+    start_line = before.count("\n") + 1
+    return start_line, start_line + old_text.count("\n")
+
+
+def execute_edit_file(
+    file_path: str,
+    old_text: str,
+    new_text: str,
+    cwd: Path,
+    *,
+    replace_all: bool = False,
+    last_read_time: float | None,
+) -> dict[str, Any]:
+    path = _ensure_absolute_path(cwd, file_path, field_name="file_path")
+    if not path.exists():
+        raise ValueError(f"file {path} does not exist, use the 'write_file' tool to create instead")
+    if not isinstance(old_text, str) or old_text == "":
+        raise ValueError("old_text is required")
+    if not isinstance(new_text, str):
+        raise ValueError("new_text must be a string")
+
+    original = path.read_text(errors="replace")
+    if old_text not in original:
+        raise ValueError("old text not found in the file, please ensure the text exists")
+    occurrences = original.count(old_text)
+    if not replace_all and occurrences > 1:
+        raise ValueError(
+            f"old text appears {occurrences} times in the file, please ensure the old text is unique or set replace_all to true"
+        )
+    if not replace_all:
+        if last_read_time is None:
+            raise ValueError("failed to get the last access time of the file")
+        if _file_mtime(path) > last_read_time:
+            raise ValueError(
+                f"file {path} has been modified since the last read either by another tool or by the user, please read the file again"
+            )
+
+    start_line, end_line = _find_line_numbers(original, old_text)
+    if replace_all:
+        content = original.replace(old_text, new_text)
+        replaced_count = occurrences
+        summary = f"File {path} has been edited successfully. Replaced {replaced_count} occurrences"
+    else:
+        content = original.replace(old_text, new_text, 1)
+        replaced_count = 1
+        summary = f"File {path} has been edited successfully"
+    path.write_text(content)
+
+    edited_block = with_numbered_lines(new_text.splitlines(), start_line) if new_text else ""
+    return {
+        "success": True,
+        "file_path": str(path),
+        "replace_all": replace_all,
+        "replaced_count": replaced_count,
+        "content": (
+            summary
+            if replace_all and replaced_count > 1
+            else f"{summary}\n\nEdited code block:\n{edited_block}".rstrip()
+        ),
+        "start_line": start_line,
+        "end_line": end_line,
+    }
+
+
+def _find_search_binary(name: str) -> str:
+    binary = shutil.which(name)
+    if not binary:
+        raise ValueError(f"{name} not found on PATH")
+    return binary
+
+
+def _validate_glob_path(path: str | None, cwd: Path) -> Path:
+    resolved = cwd if not path else _ensure_absolute_path(cwd, path, field_name="path")
+    if not resolved.exists():
+        raise ValueError(f"invalid path {resolved!r}: does not exist")
+    if not resolved.is_dir():
+        raise ValueError(
+            f"path {str(resolved)!r} is not a directory - glob searches directories, not individual files"
+        )
+    return resolved
+
+
+def execute_glob(
+    pattern: str,
+    cwd: Path,
+    *,
+    path: str | None = None,
+    ignore_gitignore: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ValueError("pattern is required")
+    search_path = _validate_glob_path(path, cwd)
+    fd_path = _find_search_binary("fd")
+    args = [fd_path, "--glob", "--type", "f", "--absolute-path"]
+    if ignore_gitignore:
+        args.extend(["--no-ignore", "--hidden"])
+    args.extend([pattern, str(search_path)])
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=SEARCH_TOOL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise ValueError(f"fd error: {stderr or 'unknown error'}")
+    files = [line for line in result.stdout.splitlines() if line.strip()]
+    files.sort(
+        key=lambda item: Path(item).stat().st_mtime if Path(item).exists() else 0,
+        reverse=True,
+    )
+    truncated = len(files) > GLOB_MAX_RESULTS
+    limited = files[:GLOB_MAX_RESULTS]
+    content = "\n".join(limited)
+    if truncated:
+        content += "\n\n[Results truncated to 100 files. Please refine your pattern to narrow down the results.]"
+    return {
+        "success": True,
+        "pattern": pattern,
+        "path": str(search_path),
+        "truncated": truncated,
+        "content": content,
+        "files": limited,
+    }
+
+
+def execute_grep(
+    pattern: str,
+    cwd: Path,
+    *,
+    path: str | None = None,
+    include: str | None = None,
+    ignore_case: bool = False,
+    fixed_strings: bool = False,
+    surround_lines: int = 0,
+    max_results: int = GREP_MAX_RESULTS,
+) -> dict[str, Any]:
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("pattern is required")
+    if max_results > GREP_MAX_RESULTS:
+        raise ValueError(f"max_results cannot exceed {GREP_MAX_RESULTS}")
+    search_path = cwd if not path else _ensure_absolute_path(cwd, path, field_name="path")
+    if not search_path.exists():
+        raise ValueError(f"invalid path {str(search_path)!r}")
+    rg_path = _find_search_binary("rg")
+
+    args = [rg_path, "--no-heading", "--line-number", "--with-filename", "--color", "never"]
+    if search_path.is_dir():
+        args.extend(["--glob", "!.*"])
+        try:
+            args.extend(["--sort", "path"])
+        except Exception:
+            pass
+    if ignore_case:
+        args.append("-i")
+    if fixed_strings:
+        args.append("-F")
+    if surround_lines > 0:
+        args.extend(["-C", str(surround_lines)])
+    if include and search_path.is_dir():
+        args.extend(["-g", include])
+    args.append(pattern)
+    args.append(str(search_path))
+
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=SEARCH_TOOL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise ValueError(f"ripgrep error: {stderr or 'unknown error'}")
+    if result.returncode == 1 or not result.stdout.strip():
+        return {
+            "success": True,
+            "pattern": pattern,
+            "path": str(search_path),
+            "include": include or "",
+            "truncated": False,
+            "content": f"No matches found for pattern '{pattern}'",
+        }
+
+    file_blocks: dict[str, list[str]] = {}
+    file_order: list[str] = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^(.*?)([:\-])(\d+)([:\-])(.*)$", line)
+        if not match:
+            continue
+        filename = match.group(1)
+        if filename not in file_blocks:
+            file_blocks[filename] = []
+            file_order.append(filename)
+        content = match.group(5)
+        if len(content) > GREP_MAX_LINE_LENGTH:
+            content = content[:GREP_MAX_LINE_LENGTH] + "... [truncated]"
+        file_blocks[filename].append(f"{match.group(3)}{match.group(2)}{content}")
+
+    ordered_files = sorted(
+        file_order,
+        key=lambda item: Path(item).stat().st_mtime if Path(item).exists() else 0,
+        reverse=True,
+    )
+    truncated = False
+    if len(ordered_files) > max_results:
+        ordered_files = ordered_files[:max_results]
+        truncated = True
+
+    parts = [f"Search results for pattern '{pattern}':"]
+    for filename in ordered_files:
+        parts.append(f"\nPattern found in file {filename}:\n")
+        parts.extend(file_blocks.get(filename, []))
+    content = "\n".join(parts).strip()
+    if len(content.encode("utf-8")) > GREP_MAX_OUTPUT_BYTES:
+        content = truncate_tool_output(content, GREP_MAX_OUTPUT_BYTES)[0]
+        truncated = True
+    if truncated:
+        content += (
+            "\n\n[TRUNCATED DUE TO MAXIMUM 100 FILE LIMIT - refine your search pattern or use include filter]"
+            if len(file_order) > max_results
+            else ""
+        )
+    return {
+        "success": True,
+        "pattern": pattern,
+        "path": str(search_path),
+        "include": include or "",
+        "truncated": truncated,
+        "content": content,
+    }
+
+
 def truncate_tool_output(
     text: str, max_bytes: int = MAX_TOOL_OUTPUT_BYTES
 ) -> tuple[str, bool]:
@@ -3284,6 +3991,111 @@ def self_test_build_system_prompt_variants() -> None:
         )
 
 
+def self_test_select_tool_names_defaults() -> None:
+    _assert_equal(
+        select_tool_names("gpt-4.1", "copilot"),
+        DEFAULT_CHAT_TOOL_NAMES,
+    )
+    _assert_equal(
+        select_tool_names("claude-sonnet", "copilot"),
+        DEFAULT_CHAT_TOOL_NAMES,
+    )
+    _assert_equal(
+        select_tool_names("gpt-5", "openai"),
+        DEFAULT_RESPONSE_TOOL_NAMES,
+    )
+
+
+def self_test_select_tool_names_allowed_override() -> None:
+    override = normalize_allowed_tools("bash,read_file,grep")
+    _assert_equal(select_tool_names("gpt-5", "openai", override), override)
+
+
+def self_test_build_system_prompt_tool_guidance() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        prompt = build_system_prompt(
+            cwd,
+            "claude-sonnet",
+            "copilot",
+            ["bash", "read_file", "write_file", "edit_file", "grep", "glob"],
+        )
+        _assert_true(
+            "prefer the `glob` and `grep` tools" in prompt,
+            "chat-style prompt should prefer grep/glob when available",
+        )
+        _assert_true(
+            "Use `read_file`, `write_file`, and `edit_file` for file changes" in prompt,
+            "chat-style prompt should prefer file tools over apply_patch",
+        )
+
+        responses_prompt = build_system_prompt(cwd, "gpt-5", "openai", None)
+        _assert_true(
+            "Use `apply_patch` for file edits." in responses_prompt,
+            "responses prompt should keep apply_patch guidance",
+        )
+
+
+def self_test_tool_specs_respect_allowed_tools() -> None:
+    agent = NanoAgent(
+        model="gpt-4.1",
+        cwd=Path.cwd(),
+        provider="openai",
+        api_key="test",
+        allowed_tools=["bash"],
+    )
+    try:
+        specs = [spec["function"]["name"] for spec in agent.tool_specs()]
+        _assert_equal(specs, ["bash"])
+    finally:
+        asyncio.run(agent.close())
+
+
+def self_test_file_tool_roundtrip() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        path = cwd / "demo.txt"
+        created = execute_write_file(str(path), "alpha\nbeta\n", cwd, last_read_time=None)
+        _assert_true(created["success"], "write_file should create a file")
+
+        read = execute_read_file(str(path), cwd)
+        _assert_true("1 | alpha" in read["content"], "read_file should number lines")
+        last_read = _file_mtime(path)
+
+        edited = execute_edit_file(
+            str(path),
+            "beta",
+            "gamma",
+            cwd,
+            replace_all=False,
+            last_read_time=last_read,
+        )
+        _assert_true(edited["success"], "edit_file should edit the file")
+        _assert_equal(path.read_text(), "alpha\ngamma\n")
+
+
+def self_test_search_tools_roundtrip() -> None:
+    fd_path = shutil.which("fd")
+    rg_path = shutil.which("rg")
+    if not fd_path or not rg_path:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        src = cwd / "src"
+        src.mkdir()
+        target = src / "demo.py"
+        target.write_text("def hello():\n    return 'hi'\n")
+
+        glob_result = execute_glob("**/*.py", cwd, path=str(cwd))
+        _assert_true(str(target) in glob_result["content"], "glob should find file")
+
+        grep_result = execute_grep("hello", cwd, path=str(cwd), include="*.py")
+        _assert_true(
+            str(target) in grep_result["content"],
+            "grep should report matching file",
+        )
+
+
 SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("normalize_session_id", self_test_normalize_session_id),
     SelfTestCase(
@@ -3331,6 +4143,21 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase(
         "build_system_prompt_variants", self_test_build_system_prompt_variants
     ),
+    SelfTestCase("select_tool_names_defaults", self_test_select_tool_names_defaults),
+    SelfTestCase(
+        "select_tool_names_allowed_override",
+        self_test_select_tool_names_allowed_override,
+    ),
+    SelfTestCase(
+        "build_system_prompt_tool_guidance",
+        self_test_build_system_prompt_tool_guidance,
+    ),
+    SelfTestCase(
+        "tool_specs_respect_allowed_tools",
+        self_test_tool_specs_respect_allowed_tools,
+    ),
+    SelfTestCase("file_tool_roundtrip", self_test_file_tool_roundtrip),
+    SelfTestCase("search_tools_roundtrip", self_test_search_tools_roundtrip),
 ]
 
 
@@ -3398,6 +4225,8 @@ class NanoAgent:
         messages: list[dict[str, Any]] | None = None,
         responses_items: list[dict[str, Any]] | None = None,
         usage: dict[str, Any] | None = None,
+        allowed_tools: list[str] | None = None,
+        debug_tools: bool = False,
     ) -> None:
         self.model = model
         self.cwd = cwd.resolve()
@@ -3434,9 +4263,18 @@ class NanoAgent:
         self.messages: list[dict[str, Any]] = list(messages or [])
         self.responses_items: list[dict[str, Any]] = list(responses_items or [])
         self.usage = SessionUsage.from_dict(usage)
+        self.allowed_tools = normalize_allowed_tools(allowed_tools)
+        self.debug_tools = debug_tools
+        self._file_access_times: dict[str, float] = {}
+        self._file_locks: dict[str, threading.Lock] = {}
+        self._file_locks_guard = threading.Lock()
         self.bash = BashRunner(self.cwd)
         self.active_skills: set[str] = set()
         self.ui = ChatUI()
+        if self.debug_tools:
+            self.ui.show_debug(
+                "resolved tools: " + ", ".join(self.active_tool_names())
+            )
         self.save_history()
 
     def completion_kwargs(self) -> dict[str, Any]:
@@ -3481,7 +4319,33 @@ class NanoAgent:
         return anthropic_thinking_config(self.reasoning_effort)
 
     def system_prompt(self) -> str:
-        return build_system_prompt(self.cwd, self.model)
+        return build_system_prompt(
+            self.cwd,
+            self.model,
+            self.provider,
+            self.allowed_tools,
+        )
+
+    def active_tool_names(self) -> list[str]:
+        return select_tool_names(self.model, self.provider, self.allowed_tools)
+
+    def _get_file_lock(self, path: Path) -> threading.Lock:
+        key = str(path)
+        with self._file_locks_guard:
+            lock = self._file_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._file_locks[key] = lock
+            return lock
+
+    def mark_file_read(self, path: Path) -> None:
+        try:
+            self._file_access_times[str(path)] = _file_mtime(path)
+        except OSError:
+            self._file_access_times[str(path)] = time.time()
+
+    def last_read_time(self, path: Path) -> float | None:
+        return self._file_access_times.get(str(path))
 
     def require_anthropic_client(self) -> AsyncAnthropic:
         if self.anthropic_client is None:
@@ -3566,6 +4430,7 @@ class NanoAgent:
             "provider": self.provider,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "allowed_tools": self.allowed_tools,
             "created_at": self.created_at,
             "updated_at": iso_now(),
             "history": {
@@ -3690,40 +4555,31 @@ class NanoAgent:
         return discover_skills(self.cwd)
 
     def tool_specs(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": bash_description(),
-                    "parameters": bash_schema(),
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "apply_patch",
-                    "description": apply_patch_description(),
-                    "parameters": apply_patch_schema(),
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "skill",
-                    "description": skill_description(self.current_skills()),
-                    "parameters": skill_schema(),
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "web_fetch",
-                    "description": web_fetch_description(),
-                    "parameters": web_fetch_schema(),
-                },
-            },
-        ]
+        tool_map: dict[str, tuple[str, dict[str, Any]]] = {
+            "bash": (bash_description(self.active_tool_names()), bash_schema()),
+            "apply_patch": (apply_patch_description(), apply_patch_schema()),
+            "read_file": (read_file_description(), read_file_schema()),
+            "write_file": (write_file_description(), write_file_schema()),
+            "edit_file": (edit_file_description(), edit_file_schema()),
+            "grep": (grep_description(), grep_schema()),
+            "glob": (glob_description(), glob_schema()),
+            "skill": (skill_description(self.current_skills()), skill_schema()),
+            "web_fetch": (web_fetch_description(), web_fetch_schema()),
+        }
+        specs: list[dict[str, Any]] = []
+        for name in self.active_tool_names():
+            description, parameters = tool_map[name]
+            specs.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return specs
 
     async def extract_from_markdown(self, prompt: str, markdown: str) -> str:
         limited = markdown[:50000]
@@ -4035,6 +4891,16 @@ class NanoAgent:
 
     async def run_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
+            active_tools = set(self.active_tool_names())
+            if self.debug_tools:
+                self.ui.show_debug(
+                    f"tool call requested: {name}; active tools: {', '.join(sorted(active_tools))}"
+                )
+            if name not in active_tools:
+                if self.debug_tools:
+                    self.ui.show_debug(f"tool call rejected: {name}")
+                raise ValueError(f"tool {name!r} is not enabled for this run")
+
             if name == "bash":
                 command, _description, timeout = validate_bash_args(
                     arguments.get("command"),
@@ -4055,6 +4921,76 @@ class NanoAgent:
                 if not isinstance(patch_input, str) or not patch_input.strip():
                     raise ValueError("input is required")
                 return execute_apply_patch(patch_input, self.cwd)
+
+            if name == "read_file":
+                result = execute_read_file(
+                    cast(str, arguments.get("file_path") or ""),
+                    self.cwd,
+                    offset=cast(int, arguments.get("offset") or 1),
+                    line_limit=cast(
+                        int,
+                        arguments.get("line_limit") or MAX_READ_LINE_LIMIT,
+                    ),
+                )
+                self.mark_file_read(Path(cast(str, result["file_path"])))
+                return result
+
+            if name == "write_file":
+                path = _ensure_absolute_path(
+                    self.cwd,
+                    cast(str, arguments.get("file_path") or ""),
+                    field_name="file_path",
+                )
+                with self._get_file_lock(path):
+                    result = execute_write_file(
+                        str(path),
+                        cast(str, arguments.get("text") or ""),
+                        self.cwd,
+                        last_read_time=self.last_read_time(path),
+                    )
+                self.mark_file_read(path)
+                return result
+
+            if name == "edit_file":
+                path = _ensure_absolute_path(
+                    self.cwd,
+                    cast(str, arguments.get("file_path") or ""),
+                    field_name="file_path",
+                )
+                with self._get_file_lock(path):
+                    result = execute_edit_file(
+                        str(path),
+                        cast(str, arguments.get("old_text") or ""),
+                        cast(str, arguments.get("new_text") or ""),
+                        self.cwd,
+                        replace_all=bool(arguments.get("replace_all", False)),
+                        last_read_time=self.last_read_time(path),
+                    )
+                self.mark_file_read(path)
+                return result
+
+            if name == "grep":
+                return execute_grep(
+                    cast(str, arguments.get("pattern") or ""),
+                    self.cwd,
+                    path=cast(str | None, arguments.get("path")),
+                    include=cast(str | None, arguments.get("include")),
+                    ignore_case=bool(arguments.get("ignore_case", False)),
+                    fixed_strings=bool(arguments.get("fixed_strings", False)),
+                    surround_lines=cast(int, arguments.get("surround_lines") or 0),
+                    max_results=cast(
+                        int,
+                        arguments.get("max_results") or GREP_MAX_RESULTS,
+                    ),
+                )
+
+            if name == "glob":
+                return execute_glob(
+                    cast(str, arguments.get("pattern") or ""),
+                    self.cwd,
+                    path=cast(str | None, arguments.get("path")),
+                    ignore_gitignore=bool(arguments.get("ignore_gitignore", False)),
+                )
 
             if name == "skill":
                 skill_name = arguments.get("skill_name")
@@ -4154,6 +5090,8 @@ async def run_chat(
     responses_items: list[dict[str, Any]] | None = None,
     usage: dict[str, Any] | None = None,
     created_at: str | None = None,
+    allowed_tools: list[str] | None = None,
+    debug_tools: bool = False,
 ) -> None:
     agent = NanoAgent(
         model=model,
@@ -4166,6 +5104,8 @@ async def run_chat(
         messages=messages,
         responses_items=responses_items,
         usage=usage,
+        allowed_tools=allowed_tools,
+        debug_tools=debug_tools,
     )
     if created_at:
         agent.created_at = created_at
@@ -4288,6 +5228,16 @@ def main(
     default=None,
     help="Reasoning effort for supported models",
 )
+@click.option(
+    "--allowed-tools",
+    default=None,
+    help="Comma-separated list of allowed tools for this run",
+)
+@click.option(
+    "--debug-tools",
+    is_flag=True,
+    help="Print resolved tool allowlist and tool-call decisions",
+)
 @click.argument("prompt_args", nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
 def run(
@@ -4300,6 +5250,8 @@ def run(
     api_key: str | None,
     base_url: str | None,
     reasoning_effort: str | None,
+    allowed_tools: str | None,
+    debug_tools: bool,
 ) -> None:
     """Run the nano agent chat loop or send a one-shot prompt."""
     prompt = " ".join(prompt_args).strip() or None
@@ -4315,6 +5267,7 @@ def run(
     restored_provider: str | None = None
     restored_model: str | None = None
     restored_reasoning_effort: str | None = None
+    restored_allowed_tools: list[str] | None = None
     restored_created_at: str | None = None
     restored_usage: dict[str, Any] | None = None
 
@@ -4325,23 +5278,20 @@ def run(
         restored_provider = cast(str, loaded["provider"])
         restored_model = cast(str, loaded["model"])
         restored_reasoning_effort = cast(str | None, loaded["reasoning_effort"])
+        restored_allowed_tools = cast(list[str] | None, loaded["allowed_tools"])
         restored_created_at = cast(str, loaded["created_at"])
         restored_messages = cast(list[dict[str, Any]], loaded["messages"])
         restored_responses_items = cast(list[dict[str, Any]], loaded["responses_items"])
         restored_usage = cast(dict[str, Any], loaded["usage"])
 
-    provider_source = ctx.get_parameter_source("provider")
-    model_source = ctx.get_parameter_source("model")
-    reasoning_source = ctx.get_parameter_source("reasoning_effort")
-
     resolved_provider = (
         provider
-        if provider_source not in {None, ParameterSource.DEFAULT}
+        if provider is not None
         else restored_provider or cast(str, config["provider"])
     )
     resolved_model = (
         model
-        if model_source not in {None, ParameterSource.DEFAULT}
+        if model is not None
         else restored_model or cast(str, config["model"])
     )
     resolved_api_key = (
@@ -4352,8 +5302,13 @@ def run(
     )
     resolved_reasoning_effort = (
         reasoning_effort
-        if reasoning_source not in {None, ParameterSource.DEFAULT}
+        if reasoning_effort is not None
         else restored_reasoning_effort or cast(str, config["reasoning_effort"])
+    )
+    resolved_allowed_tools = (
+        normalize_allowed_tools(allowed_tools)
+        if allowed_tools is not None
+        else restored_allowed_tools
     )
     if resolved_model is None or resolved_provider is None:
         raise click.ClickException("model and provider must be resolved before running")
@@ -4373,6 +5328,8 @@ def run(
                 responses_items=restored_responses_items,
                 usage=restored_usage,
                 created_at=restored_created_at,
+                allowed_tools=resolved_allowed_tools,
+                debug_tools=debug_tools,
             )
         )
     except CopilotAuthError as exc:
@@ -4419,6 +5376,16 @@ def run(
     default=None,
     help="Reasoning effort for supported models",
 )
+@click.option(
+    "--allowed-tools",
+    default=None,
+    help="Comma-separated list of allowed tools for this run",
+)
+@click.option(
+    "--debug-tools",
+    is_flag=True,
+    help="Print resolved tool allowlist and tool-call decisions",
+)
 @click.argument("prompt_args", nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
 def chat(
@@ -4431,6 +5398,8 @@ def chat(
     api_key: str | None,
     base_url: str | None,
     reasoning_effort: str | None,
+    allowed_tools: str | None,
+    debug_tools: bool,
 ) -> None:
     """Alias for run."""
     ctx.invoke(
@@ -4443,6 +5412,8 @@ def chat(
         api_key=api_key,
         base_url=base_url,
         reasoning_effort=reasoning_effort,
+        allowed_tools=allowed_tools,
+        debug_tools=debug_tools,
     )
 
 
