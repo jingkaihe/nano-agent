@@ -727,6 +727,8 @@ def is_copilot_auth_error(exc: Exception) -> bool:
 
 
 def _is_async_context_manager(value: Any) -> bool:
+    if callable(getattr(value, "__aiter__", None)):
+        return False
     return callable(getattr(value, "__aenter__", None)) and callable(
         getattr(value, "__aexit__", None)
     )
@@ -3162,6 +3164,58 @@ def self_test_call_with_provider_auth_retry_retries_stream_auth_error() -> None:
     asyncio.run(_run())
 
 
+def self_test_call_with_provider_auth_retry_leaves_async_iterables_unwrapped() -> None:
+    async def _run() -> None:
+        agent = NanoAgent.__new__(NanoAgent)
+        agent.provider = "copilot"
+        agent.api_key = None
+        agent.base_url = None
+        refresh_calls: list[bool] = []
+
+        async def fake_refresh(*, force: bool = False) -> bool:
+            refresh_calls.append(force)
+            return True
+
+        class FakeAsyncStream:
+            def __init__(self) -> None:
+                self.chunks = ["chunk-1", "chunk-2"]
+
+            def __aiter__(self) -> FakeAsyncStream:
+                return self
+
+            async def __anext__(self) -> str:
+                if not self.chunks:
+                    raise StopAsyncIteration
+                return self.chunks.pop(0)
+
+            async def __aenter__(self) -> FakeAsyncStream:
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                return False
+
+        stream = FakeAsyncStream()
+
+        def fake_call() -> FakeAsyncStream:
+            return stream
+
+        agent._refresh_copilot_clients = fake_refresh  # type: ignore[attr-defined]
+        result = await NanoAgent._call_with_provider_auth_retry(agent, fake_call)
+        _assert_true(
+            result is stream,
+            "iterator-style streams should not be wrapped as context managers",
+        )
+
+        chunks: list[str] = []
+        async for chunk in result:
+            chunks.append(chunk)
+
+        _assert_equal(chunks, ["chunk-1", "chunk-2"])
+        _assert_equal(refresh_calls, [False])
+
+    asyncio.run(_run())
+
+
 def self_test_call_with_provider_auth_retry_non_copilot_no_retry() -> None:
     async def _run() -> None:
         agent = NanoAgent.__new__(NanoAgent)
@@ -3265,6 +3319,10 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase(
         "call_with_provider_auth_retry_retries_stream_auth_error",
         self_test_call_with_provider_auth_retry_retries_stream_auth_error,
+    ),
+    SelfTestCase(
+        "call_with_provider_auth_retry_leaves_async_iterables_unwrapped",
+        self_test_call_with_provider_auth_retry_leaves_async_iterables_unwrapped,
     ),
     SelfTestCase(
         "call_with_provider_auth_retry_non_copilot_no_retry",
