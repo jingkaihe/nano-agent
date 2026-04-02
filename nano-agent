@@ -2321,9 +2321,10 @@ def apply_copilot_ephemeral_cache(
     *,
     provider: str,
     model: str,
+    endpoint: str,
 ) -> list[dict[str, Any]]:
     if not _is_copilot_provider(provider) or not model_supports_endpoint(
-        "/chat/completions", model, provider=provider
+        endpoint, model, provider=provider
     ):
         return messages
     system_indexes = [
@@ -2376,6 +2377,38 @@ def apply_copilot_ephemeral_cache(
         patched[index] = updated
 
     return patched
+
+
+def _copilot_cache_control(value: dict[str, Any]) -> dict[str, Any] | None:
+    existing = value.get("copilot_cache_control")
+    if not isinstance(existing, dict):
+        return None
+    return dict(existing)
+
+
+def _apply_copilot_cache_control_to_block(
+    block: dict[str, Any], cache_control: dict[str, Any] | None
+) -> dict[str, Any]:
+    if cache_control is None:
+        return block
+    updated = dict(block)
+    existing = updated.get("copilot_cache_control")
+    updated["copilot_cache_control"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        **cache_control,
+    }
+    return updated
+
+
+def _apply_message_copilot_cache_control_to_last_block(
+    blocks: list[dict[str, Any]], message: dict[str, Any]
+) -> list[dict[str, Any]]:
+    cache_control = _copilot_cache_control(message)
+    if cache_control is None or not blocks:
+        return blocks
+    updated = list(blocks)
+    updated[-1] = _apply_copilot_cache_control_to_block(updated[-1], cache_control)
+    return updated
 
 
 def extract_function_calls_from_response(response: Any) -> list[dict[str, Any]]:
@@ -2462,15 +2495,46 @@ def build_anthropic_messages(
         if role == "system":
             content = message.get("content")
             if isinstance(content, str) and content.strip():
-                system_blocks.append({"type": "text", "text": content})
+                system_blocks.append(
+                    _apply_copilot_cache_control_to_block(
+                        {"type": "text", "text": content},
+                        _copilot_cache_control(message),
+                    )
+                )
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        system_blocks.append(dict(item))
             continue
 
         if role == "user":
             content = message.get("content")
             if isinstance(content, str):
-                anthropic_messages.append({"role": "user", "content": content})
+                cache_control = _copilot_cache_control(message)
+                if cache_control is None:
+                    anthropic_messages.append({"role": "user", "content": content})
+                else:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                _apply_copilot_cache_control_to_block(
+                                    {"type": "text", "text": content},
+                                    cache_control,
+                                )
+                            ],
+                        }
+                    )
             elif isinstance(content, list):
-                anthropic_messages.append({"role": "user", "content": content})
+                anthropic_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            dict(item) if isinstance(item, dict) else item
+                            for item in content
+                        ],
+                    }
+                )
             continue
 
         if role == "assistant":
@@ -2512,6 +2576,7 @@ def build_anthropic_messages(
                         }
                     )
 
+            blocks = _apply_message_copilot_cache_control_to_last_block(blocks, message)
             anthropic_messages.append({"role": "assistant", "content": blocks or ""})
             continue
 
@@ -2522,20 +2587,23 @@ def build_anthropic_messages(
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id or "",
-                            "content": content
-                            if isinstance(content, str)
-                            else json.dumps(content, ensure_ascii=False),
-                        }
+                        _apply_copilot_cache_control_to_block(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_call_id or "",
+                                "content": content
+                                if isinstance(content, str)
+                                else json.dumps(content, ensure_ascii=False),
+                            },
+                            _copilot_cache_control(message),
+                        )
                     ],
                 }
             )
 
     if not system_blocks:
         return None, anthropic_messages
-    if len(system_blocks) == 1:
+    if len(system_blocks) == 1 and set(system_blocks[0].keys()) <= {"type", "text"}:
         return system_blocks[0]["text"], anthropic_messages
     return system_blocks, anthropic_messages
 
@@ -3528,6 +3596,55 @@ def self_test_build_anthropic_messages() -> None:
     _assert_equal(assistant_blocks[1]["type"], "tool_use")
     _assert_equal(messages[2]["content"][0]["type"], "tool_result")
 
+    cached_system, cached_messages = build_anthropic_messages(
+        [
+            {
+                "role": "system",
+                "content": "cached-sys",
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+            {
+                "role": "user",
+                "content": "cached-user",
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+            {
+                "role": "assistant",
+                "content": "cached-assistant",
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-2",
+                "content": "tool-output",
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+        ]
+    )
+    _assert_true(
+        isinstance(cached_system, list),
+        "system cache control should force block-based system payload",
+    )
+    cached_system_blocks = cast(list[dict[str, Any]], cached_system)
+    _assert_equal(
+        cast(dict[str, Any], cached_system_blocks[0].get("copilot_cache_control")).get(
+            "type"
+        ),
+        "ephemeral",
+    )
+    _assert_equal(
+        cached_messages[0]["content"][0]["copilot_cache_control"]["type"],
+        "ephemeral",
+    )
+    _assert_equal(
+        cached_messages[1]["content"][-1]["copilot_cache_control"]["type"],
+        "ephemeral",
+    )
+    _assert_equal(
+        cached_messages[2]["content"][0]["copilot_cache_control"]["type"],
+        "ephemeral",
+    )
+
 
 def self_test_copilot_headers() -> None:
     exchange_headers = copilot_token_exchange_headers("token")
@@ -3576,7 +3693,10 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
         ]
 
         patched = apply_copilot_ephemeral_cache(
-            messages, provider="copilot", model="claude-chat"
+            messages,
+            provider="copilot",
+            model="claude-chat",
+            endpoint="/chat/completions",
         )
         _assert_true(
             patched is not messages,
@@ -3596,7 +3716,10 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
         )
 
         unchanged = apply_copilot_ephemeral_cache(
-            messages, provider="copilot", model="claude-messages-only"
+            messages,
+            provider="copilot",
+            model="claude-messages-only",
+            endpoint="/chat/completions",
         )
         _assert_true(
             unchanged is messages, "messages-only models should not be patched"
@@ -3606,6 +3729,7 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
             messages,
             provider="copilot",
             model="claude-unspecified-endpoints",
+            endpoint="/chat/completions",
         )
         _assert_true(
             unspecified is not messages,
@@ -3616,6 +3740,7 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
             messages,
             provider="copilot",
             model="claude-missing-endpoints",
+            endpoint="/chat/completions",
         )
         _assert_true(
             missing is not messages,
@@ -3623,14 +3748,62 @@ def self_test_apply_copilot_ephemeral_cache() -> None:
         )
 
         wrong_provider = apply_copilot_ephemeral_cache(
-            messages, provider="openai", model="claude-chat"
+            messages,
+            provider="openai",
+            model="claude-chat",
+            endpoint="/chat/completions",
         )
         _assert_true(
             wrong_provider is messages, "non-copilot providers should not be patched"
         )
+
+        messages_api = apply_copilot_ephemeral_cache(
+            messages,
+            provider="copilot",
+            model="claude-messages-only",
+            endpoint="/v1/messages",
+        )
+        _assert_true(
+            messages_api is not messages,
+            "messages endpoint should also receive copilot cache markers",
+        )
+        _assert_equal(
+            messages_api[0]["copilot_cache_control"]["type"], "ephemeral"
+        )
     finally:
         COPILOT_MODELS_CACHE = original_cache
         COPILOT_MODELS_CACHE_EXPIRES_AT = original_cache_expires_at
+
+
+def self_test_prompt_cache_keys() -> None:
+    agent = NanoAgent(
+        model="gpt-5",
+        cwd=Path.cwd(),
+        provider="openai",
+        api_key="test",
+        session_id="session-openai",
+    )
+    try:
+        _assert_equal(
+            agent.completion_kwargs().get("prompt_cache_key"),
+            "session-openai",
+        )
+        _assert_equal(agent.responses_prompt_cache_key(), "session-openai")
+    finally:
+        asyncio.run(agent.close())
+
+    copilot_agent = cast(Any, object.__new__(NanoAgent))
+    copilot_agent.provider = "copilot"
+    copilot_agent.session_id = "session-copilot"
+    copilot_agent.reasoning_effort = None
+    _assert_true(
+        "prompt_cache_key" not in NanoAgent.completion_kwargs(copilot_agent),
+        "copilot chat completions should not use OpenAI prompt_cache_key",
+    )
+    _assert_equal(
+        NanoAgent.responses_prompt_cache_key(copilot_agent),
+        None,
+    )
 
 
 def self_test_models_cache_roundtrip() -> None:
@@ -4125,6 +4298,7 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase(
         "apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache
     ),
+    SelfTestCase("prompt_cache_keys", self_test_prompt_cache_keys),
     SelfTestCase("models_cache_roundtrip", self_test_models_cache_roundtrip),
     SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
     SelfTestCase(
@@ -4301,7 +4475,7 @@ class NanoAgent:
         return kwargs
 
     def responses_prompt_cache_key(self) -> str | None:
-        if self.provider.strip().lower() not in {"openai", "copilot"}:
+        if self.provider.strip().lower() != "openai":
             return None
         return self.session_id
 
@@ -4309,7 +4483,10 @@ class NanoAgent:
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         return apply_copilot_ephemeral_cache(
-            messages, provider=self.provider, model=self.model
+            messages,
+            provider=self.provider,
+            model=self.model,
+            endpoint="/chat/completions",
         )
 
     def chat_extra_body(self) -> dict[str, Any] | None:
@@ -4827,8 +5004,11 @@ class NanoAgent:
             assistant_thinking_parts: list[str] = []
 
             system_prompt = self.system_prompt()
-            prepared_messages = self.prepare_chat_messages(
-                [{"role": "system", "content": system_prompt}, *self.messages]
+            prepared_messages = apply_copilot_ephemeral_cache(
+                [{"role": "system", "content": system_prompt}, *self.messages],
+                provider=self.provider,
+                model=self.model,
+                endpoint="/v1/messages",
             )
             system, anthropic_messages = build_anthropic_messages(prepared_messages)
 
