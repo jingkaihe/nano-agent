@@ -515,6 +515,7 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
     model = data.get("model")
     provider = data.get("provider")
     reasoning_effort = data.get("reasoning_effort")
+    weak_model = data.get("weak_model")
     allowed_tools = normalize_allowed_tools(data.get("allowed_tools"))
     raw_history = data.get("history")
     history: dict[str, Any] = raw_history if isinstance(raw_history, dict) else {}
@@ -531,6 +532,8 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
         raise ValueError(f"history session is missing provider: {normalized}")
     if reasoning_effort is not None and not isinstance(reasoning_effort, str):
         reasoning_effort = None
+    if weak_model is not None and not isinstance(weak_model, str):
+        weak_model = None
     if not isinstance(messages, list):
         raise ValueError(f"history session has invalid messages: {normalized}")
     if not isinstance(responses_items, list):
@@ -557,6 +560,7 @@ def load_conversation_history(session_id: str) -> dict[str, Any]:
         "model": model,
         "provider": provider,
         "reasoning_effort": reasoning_effort,
+        "weak_model": weak_model,
         "allowed_tools": allowed_tools,
         "created_at": created_at,
         "updated_at": updated_at,
@@ -1274,6 +1278,16 @@ def _is_gpt_41_model(model: str | None) -> bool:
         return False
     normalized = model.strip().lower()
     return normalized == "gpt-4.1" or normalized.startswith("gpt-4.1-")
+
+
+def default_weak_model(provider: str, model: str | None = None) -> str:
+    normalized_provider = provider.strip().lower()
+    normalized_model = (model or "").strip()
+    if normalized_provider == "copilot" and _is_anthropic_like_model(normalized_model):
+        return "claude-haiku-4.5"
+    if normalized_provider in {"copilot", "openai"}:
+        return "gpt-4.1"
+    return (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
 def _default_system_instructions(
@@ -3806,6 +3820,52 @@ def self_test_prompt_cache_keys() -> None:
     )
 
 
+def self_test_copilot_initiator_headers() -> None:
+    agent = cast(Any, object.__new__(NanoAgent))
+    agent.provider = "copilot"
+    agent._copilot_next_initiator = "agent"
+
+    _assert_equal(
+        NanoAgent.copilot_extra_headers(agent),
+        {"x-initiator": "agent"},
+    )
+    _assert_equal(
+        agent._copilot_next_initiator,
+        "agent",
+    )
+
+    agent._copilot_next_initiator = "user"
+    _assert_equal(
+        NanoAgent.copilot_extra_headers(agent),
+        {"x-initiator": "user"},
+    )
+    _assert_equal(
+        agent._copilot_next_initiator,
+        "agent",
+    )
+
+    agent._copilot_next_initiator = "user"
+    _assert_equal(
+        NanoAgent.copilot_extra_headers(agent, consume=False),
+        {"x-initiator": "user"},
+    )
+    _assert_equal(
+        agent._copilot_next_initiator,
+        "user",
+    )
+
+    openai_agent = cast(Any, object.__new__(NanoAgent))
+    openai_agent.provider = "openai"
+    openai_agent._copilot_next_initiator = "user"
+    _assert_equal(NanoAgent.copilot_extra_headers(openai_agent), None)
+
+
+def self_test_default_weak_model() -> None:
+    _assert_equal(default_weak_model("copilot", "claude-sonnet-4.5"), "claude-haiku-4.5")
+    _assert_equal(default_weak_model("copilot", "gpt-5"), "gpt-4.1")
+    _assert_equal(default_weak_model("openai", "gpt-5"), "gpt-4.1")
+
+
 def self_test_models_cache_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "models.json"
@@ -4299,6 +4359,8 @@ SELF_TESTS: list[SelfTestCase] = [
         "apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache
     ),
     SelfTestCase("prompt_cache_keys", self_test_prompt_cache_keys),
+    SelfTestCase("copilot_initiator_headers", self_test_copilot_initiator_headers),
+    SelfTestCase("default_weak_model", self_test_default_weak_model),
     SelfTestCase("models_cache_roundtrip", self_test_models_cache_roundtrip),
     SelfTestCase("truncate_tool_output", self_test_truncate_tool_output),
     SelfTestCase(
@@ -4410,6 +4472,7 @@ class NanoAgent:
         api_key: str | None = None,
         base_url: str | None = None,
         reasoning_effort: str | None = None,
+        weak_model: str | None = None,
         session_id: str | None = None,
         messages: list[dict[str, Any]] | None = None,
         responses_items: list[dict[str, Any]] | None = None,
@@ -4427,6 +4490,8 @@ class NanoAgent:
         self.reasoning_effort = (
             None if reasoning_effort in {None, "none"} else reasoning_effort
         )
+        resolved_weak_model = weak_model.strip() if isinstance(weak_model, str) else ""
+        self.weak_model = resolved_weak_model or default_weak_model(provider, model)
         self.created_at = iso_now()
         if self.history_path.exists():
             try:
@@ -4437,6 +4502,7 @@ class NanoAgent:
         self.api_key = api_key
         self.base_url = base_url
         self._copilot_token: str | None = None
+        self._copilot_next_initiator = "agent"
         self.client = create_client(
             provider=provider, api_key=api_key, base_url=base_url
         )
@@ -4478,6 +4544,19 @@ class NanoAgent:
         if self.provider.strip().lower() not in {"openai", "copilot"}:
             return None
         return self.session_id
+
+    def copilot_extra_headers(
+        self, *, initiator: str | None = None, consume: bool = True
+    ) -> dict[str, str] | None:
+        if not _is_copilot_provider(self.provider):
+            return None
+        resolved = initiator
+        if resolved is None:
+            queued = self._copilot_next_initiator
+            resolved = queued if queued in {"user", "agent"} else "agent"
+            if consume:
+                self._copilot_next_initiator = "agent"
+        return {"x-initiator": resolved}
 
     def prepare_chat_messages(
         self, messages: list[dict[str, Any]]
@@ -4622,6 +4701,7 @@ class NanoAgent:
             "provider": self.provider,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "weak_model": self.weak_model,
             "allowed_tools": self.allowed_tools,
             "created_at": self.created_at,
             "updated_at": iso_now(),
@@ -4775,9 +4855,48 @@ class NanoAgent:
 
     async def extract_from_markdown(self, prompt: str, markdown: str) -> str:
         limited = markdown[:50000]
-        if should_use_responses_api(self.model):
+        summary_model = self.weak_model
+        if (
+            _is_copilot_provider(self.provider)
+            and should_use_anthropic_messages_api(self.provider, summary_model)
+        ):
             kwargs: dict[str, Any] = {
-                "model": self.model,
+                "model": summary_model,
+                "max_tokens": 4096,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Request: "
+                                    f"{prompt}\n\nWeb content:\n\n{limited}"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+            extra_headers = self.copilot_extra_headers(
+                initiator="user", consume=False
+            )
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
+            response = await self._call_with_provider_auth_retry(
+                lambda: self.require_anthropic_client().messages.create(**kwargs)
+            )
+            self.record_usage(
+                getattr(response, "usage", None),
+                api="messages",
+                model=getattr(response, "model", None) or summary_model,
+            )
+            turn = self._finalize_anthropic_turn(response)
+            return cast(str, turn.message.get("content") or "")
+
+        if should_use_responses_api(summary_model):
+            kwargs: dict[str, Any] = {
+                "model": summary_model,
                 "instructions": "You extract only the information requested from supplied web content. If the answer is not present, say so plainly.",
                 "input": [
                     {
@@ -4791,19 +4910,25 @@ class NanoAgent:
                     }
                 ],
             }
-            prompt_cache_key = self.responses_prompt_cache_key()
+            extra_headers = self.copilot_extra_headers(
+                initiator="user", consume=False
+            )
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
+            prompt_cache_key = (
+                self.session_id
+                if self.provider.strip().lower() in {"openai", "copilot"}
+                else None
+            )
             if prompt_cache_key:
                 kwargs["prompt_cache_key"] = prompt_cache_key
-            reasoning = self.responses_reasoning()
-            if reasoning:
-                kwargs["reasoning"] = reasoning
             response = await self._call_with_provider_auth_retry(
                 lambda: self.client.responses.create(**kwargs)
             )
             self.record_usage(
                 getattr(response, "usage", None),
                 api="responses",
-                model=getattr(response, "model", None),
+                model=getattr(response, "model", None) or summary_model,
             )
             plain = _to_plain_data(response) or {}
             output_text = getattr(response, "output_text", None)
@@ -4835,18 +4960,23 @@ class NanoAgent:
                 ]
             ),
         )
+        chat_kwargs: dict[str, Any] = {
+            "model": summary_model,
+            "messages": chat_messages,
+            "extra_headers": self.copilot_extra_headers(
+                initiator="user", consume=False
+            ),
+            "extra_body": self.chat_extra_body(),
+        }
+        if self.provider.strip().lower() == "openai":
+            chat_kwargs["prompt_cache_key"] = self.session_id
         response = await self._call_with_provider_auth_retry(
-            lambda: self.client.chat.completions.create(
-                model=self.model,
-                messages=chat_messages,
-                extra_body=self.chat_extra_body(),
-                **self.completion_kwargs(),
-            )
+            lambda: self.client.chat.completions.create(**chat_kwargs)
         )
         self.record_usage(
             getattr(response, "usage", None),
             api="chat.completions",
-            model=getattr(response, "model", None),
+            model=getattr(response, "model", None) or summary_model,
         )
         return response.choices[0].message.content or ""
 
@@ -4861,6 +4991,9 @@ class NanoAgent:
                 "tools": chat_tools_to_responses_tools(chat_tools),
                 "tool_choice": "auto",
             }
+            extra_headers = self.copilot_extra_headers()
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
             prompt_cache_key = self.responses_prompt_cache_key()
             if prompt_cache_key:
                 kwargs["prompt_cache_key"] = prompt_cache_key
@@ -4932,6 +5065,7 @@ class NanoAgent:
                     tool_choice="auto",
                     stream=True,
                     stream_options={"include_usage": True},
+                    extra_headers=self.copilot_extra_headers(),
                     extra_body=self.chat_extra_body(),
                     **self.completion_kwargs(),
                 )
@@ -5023,6 +5157,9 @@ class NanoAgent:
             thinking = self.anthropic_thinking()
             if thinking is not None:
                 kwargs["thinking"] = thinking
+            extra_headers = self.copilot_extra_headers()
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
 
             stream_cm = await self._call_with_provider_auth_retry(
                 lambda: self.require_anthropic_client().messages.stream(**kwargs)
@@ -5257,6 +5394,8 @@ The skill directory is located at: {skill.directory}
     async def send(self, user_input: str) -> None:
         self.ui.show_user(user_input)
         self.messages.append({"role": "user", "content": user_input})
+        if _is_copilot_provider(self.provider):
+            self._copilot_next_initiator = "user"
         if should_use_anthropic_messages_api(self.provider, self.model):
             await self.send_via_anthropic_messages()
         elif should_use_responses_api(self.model):
@@ -5279,6 +5418,7 @@ async def run_chat(
     api_key: str | None = None,
     base_url: str | None = None,
     reasoning_effort: str | None = None,
+    weak_model: str | None = None,
     session_id: str | None = None,
     resumed: bool = False,
     messages: list[dict[str, Any]] | None = None,
@@ -5295,6 +5435,7 @@ async def run_chat(
         api_key=api_key,
         base_url=base_url,
         reasoning_effort=reasoning_effort,
+        weak_model=weak_model,
         session_id=session_id,
         messages=messages,
         responses_items=responses_items,
@@ -5354,6 +5495,11 @@ async def run_chat(
     show_default=True,
     help="Reasoning effort for supported models",
 )
+@click.option(
+    "--weak-model",
+    default=None,
+    help="Model used for helper tasks like web_fetch extraction",
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -5362,6 +5508,7 @@ def main(
     api_key: str | None,
     base_url: str | None,
     reasoning_effort: str,
+    weak_model: str | None,
 ) -> None:
     """Nano agent CLI."""
     ctx.ensure_object(dict)
@@ -5372,6 +5519,7 @@ def main(
             "api_key": api_key,
             "base_url": base_url,
             "reasoning_effort": reasoning_effort,
+            "weak_model": weak_model,
         }
     )
 
@@ -5424,6 +5572,11 @@ def main(
     help="Reasoning effort for supported models",
 )
 @click.option(
+    "--weak-model",
+    default=None,
+    help="Model used for helper tasks like web_fetch extraction",
+)
+@click.option(
     "--allowed-tools",
     default=None,
     help="Comma-separated list of allowed tools for this run",
@@ -5445,6 +5598,7 @@ def run(
     api_key: str | None,
     base_url: str | None,
     reasoning_effort: str | None,
+    weak_model: str | None,
     allowed_tools: str | None,
     debug_tools: bool,
 ) -> None:
@@ -5462,6 +5616,7 @@ def run(
     restored_provider: str | None = None
     restored_model: str | None = None
     restored_reasoning_effort: str | None = None
+    restored_weak_model: str | None = None
     restored_allowed_tools: list[str] | None = None
     restored_created_at: str | None = None
     restored_usage: dict[str, Any] | None = None
@@ -5473,6 +5628,7 @@ def run(
         restored_provider = cast(str, loaded["provider"])
         restored_model = cast(str, loaded["model"])
         restored_reasoning_effort = cast(str | None, loaded["reasoning_effort"])
+        restored_weak_model = cast(str | None, loaded.get("weak_model"))
         restored_allowed_tools = cast(list[str] | None, loaded["allowed_tools"])
         restored_created_at = cast(str, loaded["created_at"])
         restored_messages = cast(list[dict[str, Any]], loaded["messages"])
@@ -5500,6 +5656,11 @@ def run(
         if reasoning_effort is not None
         else restored_reasoning_effort or cast(str, config["reasoning_effort"])
     )
+    resolved_weak_model = (
+        weak_model
+        if weak_model is not None
+        else restored_weak_model or cast(str | None, config.get("weak_model"))
+    )
     resolved_allowed_tools = (
         normalize_allowed_tools(allowed_tools)
         if allowed_tools is not None
@@ -5517,6 +5678,7 @@ def run(
                 api_key=resolved_api_key,
                 base_url=resolved_base_url,
                 reasoning_effort=resolved_reasoning_effort,
+                weak_model=resolved_weak_model,
                 session_id=session_id,
                 resumed=resumed,
                 messages=restored_messages,
@@ -5593,6 +5755,7 @@ def chat(
     api_key: str | None,
     base_url: str | None,
     reasoning_effort: str | None,
+    weak_model: str | None,
     allowed_tools: str | None,
     debug_tools: bool,
 ) -> None:
@@ -5607,6 +5770,7 @@ def chat(
         api_key=api_key,
         base_url=base_url,
         reasoning_effort=reasoning_effort,
+        weak_model=weak_model,
         allowed_tools=allowed_tools,
         debug_tools=debug_tools,
     )
