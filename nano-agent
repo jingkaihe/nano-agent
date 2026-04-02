@@ -5734,6 +5734,11 @@ def run(
     help="Reasoning effort for supported models",
 )
 @click.option(
+    "--weak-model",
+    default=None,
+    help="Model used for helper tasks like web_fetch extraction",
+)
+@click.option(
     "--allowed-tools",
     default=None,
     help="Comma-separated list of allowed tools for this run",
