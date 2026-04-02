@@ -3802,7 +3802,7 @@ def self_test_prompt_cache_keys() -> None:
     )
     _assert_equal(
         NanoAgent.responses_prompt_cache_key(copilot_agent),
-        None,
+        "session-copilot",
     )
 
 
@@ -4475,7 +4475,7 @@ class NanoAgent:
         return kwargs
 
     def responses_prompt_cache_key(self) -> str | None:
-        if self.provider.strip().lower() != "openai":
+        if self.provider.strip().lower() not in {"openai", "copilot"}:
             return None
         return self.session_id
 
