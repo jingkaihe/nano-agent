@@ -82,6 +82,11 @@ COPILOT_OPENAI_USER_AGENT = "GithubCopilot/1.342.0"
 COPILOT_GITHUB_API_VERSION = "2025-04-01"
 COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION = "electron-fetch"
 GITHUB_REST_API_VERSION = "2026-03-10"
+COPILOT_USAGE_ENDPOINTS = {
+    "user": "/users/{target}/settings/billing/premium_request/usage",
+    "org": "/organizations/{target}/settings/billing/premium_request/usage",
+    "enterprise": "/enterprises/{target}/settings/billing/premium_request/usage",
+}
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "gpt-4.1")
 DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
@@ -1145,30 +1150,49 @@ def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
     console.print(table)
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def build_copilot_usage_endpoint(
-    *, username: str | None = None, org: str | None = None
+    *,
+    username: str | None = None,
+    org: str | None = None,
+    enterprise: str | None = None,
 ) -> str:
-    normalized_username = username.strip() if isinstance(username, str) else ""
-    normalized_org = org.strip() if isinstance(org, str) else ""
-    if normalized_username and normalized_org:
-        raise ValueError("Use either --username or --org, not both.")
-    if normalized_org:
-        return f"/organizations/{normalized_org}/settings/billing/premium_request/usage"
-    if normalized_username:
-        return f"/users/{normalized_username}/settings/billing/premium_request/usage"
-    raise ValueError("username or org is required")
+    targets = {
+        "user": _normalize_optional_text(username),
+        "org": _normalize_optional_text(org),
+        "enterprise": _normalize_optional_text(enterprise),
+    }
+    selected = [(scope, target) for scope, target in targets.items() if target]
+    if len(selected) != 1:
+        raise ValueError(
+            "Specify exactly one of --user/--username, --org, or --enterprise."
+        )
+    scope, target = selected[0]
+    return COPILOT_USAGE_ENDPOINTS[scope].format(target=target)
 
 
-def build_copilot_usage_gh_args(
+def gh_api_json(
     endpoint: str,
     *,
+    timeout: int = 30,
     year: int | None = None,
     month: int | None = None,
     day: int | None = None,
     model: str | None = None,
     product: str | None = None,
-) -> list[str]:
+) -> dict[str, Any]:
+    binary = shutil.which("gh")
+    if not binary:
+        raise ValueError("gh not found on PATH")
+
     args = [
+        binary,
         "api",
         endpoint,
         "--method",
@@ -1178,28 +1202,21 @@ def build_copilot_usage_gh_args(
         "-H",
         f"X-GitHub-Api-Version: {GITHUB_REST_API_VERSION}",
     ]
-    if year is not None:
-        args.extend(["-F", f"year={year}"])
-    if month is not None:
-        args.extend(["-F", f"month={month}"])
-    if day is not None:
-        args.extend(["-F", f"day={day}"])
-    if model:
-        args.extend(["-F", f"model={model}"])
-    if product:
-        args.extend(["-F", f"product={product}"])
-    return args
+    query = {
+        "year": year,
+        "month": month,
+        "day": day,
+        "model": _normalize_optional_text(model),
+        "product": _normalize_optional_text(product),
+    }
+    for key, value in query.items():
+        if value is None:
+            continue
+        args.extend(["-F", f"{key}={value}"])
 
-
-def _run_gh_command(
-    args: list[str], *, timeout: int = 30
-) -> subprocess.CompletedProcess[str]:
-    binary = shutil.which("gh")
-    if not binary:
-        raise ValueError("gh not found on PATH")
     try:
-        return subprocess.run(
-            [binary, *args],
+        result = subprocess.run(
+            args,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1208,17 +1225,9 @@ def _run_gh_command(
     except OSError as exc:
         raise ValueError(f"failed to execute gh: {exc}") from exc
 
-
-def _gh_error_message(result: subprocess.CompletedProcess[str]) -> str:
-    return (result.stderr or result.stdout or "unknown gh error").strip()
-
-
-def _gh_json_output(
-    args: list[str], *, timeout: int = 30
-) -> dict[str, Any]:
-    result = _run_gh_command(args, timeout=timeout)
     if result.returncode != 0:
-        raise ValueError(f"gh api failed: {_gh_error_message(result)}")
+        message = (result.stderr or result.stdout or "unknown gh error").strip()
+        raise ValueError(f"gh api failed: {message}")
 
     try:
         payload = json.loads(result.stdout)
@@ -1229,47 +1238,30 @@ def _gh_json_output(
     return payload
 
 
-def resolve_gh_authenticated_username() -> str:
-    result = _run_gh_command(["api", "/user", "--jq", ".login"], timeout=15)
-    if result.returncode != 0:
-        raise ValueError(f"Failed to resolve GitHub username: {_gh_error_message(result)}")
-
-    username = result.stdout.strip()
-    if not username:
-        raise ValueError("Failed to resolve GitHub username from gh auth context")
-    return username
-
-
 def fetch_copilot_usage_report(
     *,
     username: str | None = None,
     org: str | None = None,
+    enterprise: str | None = None,
     year: int | None = None,
     month: int | None = None,
     day: int | None = None,
     model: str | None = None,
     product: str | None = None,
 ) -> dict[str, Any]:
-    resolved_username = username.strip() if isinstance(username, str) else ""
-    resolved_org = org.strip() if isinstance(org, str) else ""
-    if not resolved_username and not resolved_org:
-        resolved_username = resolve_gh_authenticated_username()
-
     endpoint = build_copilot_usage_endpoint(
-        username=resolved_username or None,
-        org=resolved_org or None,
+        username=username,
+        org=org,
+        enterprise=enterprise,
     )
-    args = build_copilot_usage_gh_args(
+    return gh_api_json(
         endpoint,
         year=year,
         month=month,
         day=day,
-        model=model.strip() if isinstance(model, str) and model.strip() else None,
-        product=(
-            product.strip() if isinstance(product, str) and product.strip() else None
-        ),
+        model=model,
+        product=product,
     )
-    return _gh_json_output(args)
 
 
 def _coerce_usage_float(value: Any) -> float:
@@ -1340,7 +1332,11 @@ def format_copilot_usage_time_period(value: Any) -> str:
 def render_copilot_usage_report(report: dict[str, Any]) -> None:
     console = Console()
     raw_items = report.get("usageItems")
-    items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+    items = (
+        [item for item in raw_items if isinstance(item, dict)]
+        if isinstance(raw_items, list)
+        else []
+    )
     summary = summarize_copilot_usage_report(report)
 
     details = Table(show_header=False, box=None, pad_edge=False)
@@ -1349,10 +1345,13 @@ def render_copilot_usage_report(report: dict[str, Any]) -> None:
 
     user = report.get("user")
     organization = report.get("organization")
+    enterprise = report.get("enterprise")
     if isinstance(user, str) and user.strip():
         details.add_row("User", user)
     elif isinstance(organization, str) and organization.strip():
         details.add_row("Organization", organization)
+    elif isinstance(enterprise, str) and enterprise.strip():
+        details.add_row("Enterprise", enterprise)
 
     period = format_copilot_usage_time_period(report.get("timePeriod"))
     if period:
@@ -4114,40 +4113,107 @@ def self_test_build_copilot_usage_endpoint() -> None:
         build_copilot_usage_endpoint(org="github"),
         "/organizations/github/settings/billing/premium_request/usage",
     )
+    _assert_equal(
+        build_copilot_usage_endpoint(enterprise="octo-enterprise"),
+        "/enterprises/octo-enterprise/settings/billing/premium_request/usage",
+    )
     try:
         build_copilot_usage_endpoint(username="monalisa", org="github")
     except ValueError:
         pass
     else:
         raise AssertionError("usage endpoint should reject both username and org")
+    try:
+        build_copilot_usage_endpoint()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("usage endpoint should require one scope")
 
 
-def self_test_build_copilot_usage_gh_args() -> None:
-    args = build_copilot_usage_gh_args(
-        "/users/monalisa/settings/billing/premium_request/usage",
-        year=2026,
-        month=4,
-        day=7,
-        model="gpt-5",
-        product="copilot",
-    )
-    _assert_equal(args[:6], [
-        "api",
-        "/users/monalisa/settings/billing/premium_request/usage",
-        "--method",
-        "GET",
-        "-H",
-        "Accept: application/vnd.github+json",
-    ])
-    _assert_true(
-        f"X-GitHub-Api-Version: {GITHUB_REST_API_VERSION}" in args,
-        "usage command should include a GitHub API version header",
-    )
-    _assert_true("year=2026" in args, "usage command should pass year")
-    _assert_true("month=4" in args, "usage command should pass month")
-    _assert_true("day=7" in args, "usage command should pass day")
-    _assert_true("model=gpt-5" in args, "usage command should pass model")
-    _assert_true("product=copilot" in args, "usage command should pass product")
+def self_test_gh_api_json() -> None:
+    original_run = subprocess.run
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        _assert_equal(kwargs.get("timeout"), 30)
+        command = cast(list[str], args[0])
+        _assert_equal(command[1:7], [
+            "api",
+            "/users/monalisa/settings/billing/premium_request/usage",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+        ])
+        _assert_true(
+            f"X-GitHub-Api-Version: {GITHUB_REST_API_VERSION}" in command,
+            "usage command should include a GitHub API version header",
+        )
+        _assert_true("year=2026" in command, "usage command should pass year")
+        _assert_true("month=4" in command, "usage command should pass month")
+        _assert_true("day=7" in command, "usage command should pass day")
+        _assert_true("model=gpt-5" in command, "usage command should pass model")
+        _assert_true("product=copilot" in command, "usage command should pass product")
+        return subprocess.CompletedProcess(command, 0, stdout='{"usageItems": []}', stderr="")
+
+    try:
+        cast(Any, subprocess).run = fake_run
+        payload = gh_api_json(
+            "/users/monalisa/settings/billing/premium_request/usage",
+            year=2026,
+            month=4,
+            day=7,
+            model="gpt-5",
+            product="copilot",
+        )
+    finally:
+        cast(Any, subprocess).run = original_run
+
+    _assert_equal(payload, {"usageItems": []})
+
+
+def self_test_fetch_copilot_usage_report_requires_explicit_scope() -> None:
+    try:
+        fetch_copilot_usage_report()
+    except ValueError:
+        return
+    raise AssertionError("usage command should require explicit scope")
+
+
+def self_test_fetch_copilot_usage_report() -> None:
+    original = globals()["gh_api_json"]
+
+    def fake_gh_api_json(endpoint: str, **kwargs: Any) -> dict[str, Any]:
+        _assert_equal(
+            endpoint,
+            "/enterprises/octo-enterprise/settings/billing/premium_request/usage",
+        )
+        _assert_equal(
+            kwargs,
+            {
+                "year": 2026,
+                "month": 4,
+                "day": 7,
+                "model": "gpt-5",
+                "product": "copilot",
+            },
+        )
+        return {"usageItems": []}
+
+    try:
+        globals()["gh_api_json"] = fake_gh_api_json
+        payload = fetch_copilot_usage_report(
+            enterprise="octo-enterprise",
+            year=2026,
+            month=4,
+            day=7,
+            model="gpt-5",
+            product="copilot",
+        )
+    finally:
+        globals()["gh_api_json"] = original
+
+    _assert_equal(payload, {"usageItems": []})
 
 
 def self_test_summarize_copilot_usage_report() -> None:
@@ -4891,8 +4957,13 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase(
         "build_copilot_usage_endpoint", self_test_build_copilot_usage_endpoint
     ),
+    SelfTestCase("gh_api_json", self_test_gh_api_json),
     SelfTestCase(
-        "build_copilot_usage_gh_args", self_test_build_copilot_usage_gh_args
+        "fetch_copilot_usage_report_requires_explicit_scope",
+        self_test_fetch_copilot_usage_report_requires_explicit_scope,
+    ),
+    SelfTestCase(
+        "fetch_copilot_usage_report", self_test_fetch_copilot_usage_report
     ),
     SelfTestCase(
         "summarize_copilot_usage_report", self_test_summarize_copilot_usage_report
@@ -6405,8 +6476,10 @@ def copilot_group() -> None:
 
 
 @copilot_group.command(name="usage")
-@click.option("--username", default=None, help="GitHub username to query")
+@click.option("--user", "username", default=None, help="GitHub username to query")
+@click.option("--username", "username_alias", default=None, hidden=True)
 @click.option("--org", default=None, help="GitHub organization to query")
+@click.option("--enterprise", default=None, help="GitHub enterprise to query")
 @click.option("--year", type=int, default=None, help="Billing year to query")
 @click.option("--month", type=int, default=None, help="Billing month to query")
 @click.option("--day", type=int, default=None, help="Billing day to query")
@@ -6414,7 +6487,9 @@ def copilot_group() -> None:
 @click.option("--product", default=None, help="Filter by product name")
 def copilot_usage_command(
     username: str | None,
+    username_alias: str | None,
     org: str | None,
+    enterprise: str | None,
     year: int | None,
     month: int | None,
     day: int | None,
@@ -6422,8 +6497,12 @@ def copilot_usage_command(
     product: str | None,
 ) -> None:
     """Show Copilot premium request usage via gh api."""
-    if username and org:
-        raise click.UsageError("Use either --username or --org, not both.")
+    resolved_username = username if username is not None else username_alias
+    selected_scopes = [value for value in (resolved_username, org, enterprise) if value]
+    if len(selected_scopes) != 1:
+        raise click.UsageError(
+            "Specify exactly one of --user/--username, --org, or --enterprise."
+        )
     if year is not None and year < 0:
         raise click.UsageError("--year must be a positive integer")
     if month is not None and not 1 <= month <= 12:
@@ -6433,8 +6512,9 @@ def copilot_usage_command(
 
     try:
         report = fetch_copilot_usage_report(
-            username=username,
+            username=resolved_username,
             org=org,
+            enterprise=enterprise,
             year=year,
             month=month,
             day=day,
