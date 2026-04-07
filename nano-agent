@@ -81,6 +81,7 @@ COPILOT_CHAT_USER_AGENT = "GitHubCopilotChat/0.26.7"
 COPILOT_OPENAI_USER_AGENT = "GithubCopilot/1.342.0"
 COPILOT_GITHUB_API_VERSION = "2025-04-01"
 COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION = "electron-fetch"
+GITHUB_REST_API_VERSION = "2026-03-10"
 
 DEFAULT_MODEL = os.getenv("NANO_AGENT_MODEL", "gpt-4.1")
 DEFAULT_PROVIDER = os.getenv("NANO_AGENT_PROVIDER", "copilot")
@@ -1141,6 +1142,266 @@ def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
             str(preview).lower() if isinstance(preview, bool) else "",
         )
 
+    console.print(table)
+
+
+def build_copilot_usage_endpoint(
+    *, username: str | None = None, org: str | None = None
+) -> str:
+    normalized_username = username.strip() if isinstance(username, str) else ""
+    normalized_org = org.strip() if isinstance(org, str) else ""
+    if normalized_username and normalized_org:
+        raise ValueError("Use either --username or --org, not both.")
+    if normalized_org:
+        return f"/organizations/{normalized_org}/settings/billing/premium_request/usage"
+    if normalized_username:
+        return f"/users/{normalized_username}/settings/billing/premium_request/usage"
+    raise ValueError("username or org is required")
+
+
+def build_copilot_usage_gh_args(
+    endpoint: str,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+    day: int | None = None,
+    model: str | None = None,
+    product: str | None = None,
+) -> list[str]:
+    args = [
+        "api",
+        endpoint,
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        f"X-GitHub-Api-Version: {GITHUB_REST_API_VERSION}",
+    ]
+    if year is not None:
+        args.extend(["-F", f"year={year}"])
+    if month is not None:
+        args.extend(["-F", f"month={month}"])
+    if day is not None:
+        args.extend(["-F", f"day={day}"])
+    if model:
+        args.extend(["-F", f"model={model}"])
+    if product:
+        args.extend(["-F", f"product={product}"])
+    return args
+
+
+def _run_gh_command(
+    args: list[str], *, timeout: int = 30
+) -> subprocess.CompletedProcess[str]:
+    binary = shutil.which("gh")
+    if not binary:
+        raise ValueError("gh not found on PATH")
+    try:
+        return subprocess.run(
+            [binary, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"failed to execute gh: {exc}") from exc
+
+
+def _gh_error_message(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr or result.stdout or "unknown gh error").strip()
+
+
+def _gh_json_output(
+    args: list[str], *, timeout: int = 30
+) -> dict[str, Any]:
+    result = _run_gh_command(args, timeout=timeout)
+    if result.returncode != 0:
+        raise ValueError(f"gh api failed: {_gh_error_message(result)}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("gh api returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("gh api returned an unexpected response shape")
+    return payload
+
+
+def resolve_gh_authenticated_username() -> str:
+    result = _run_gh_command(["api", "/user", "--jq", ".login"], timeout=15)
+    if result.returncode != 0:
+        raise ValueError(f"Failed to resolve GitHub username: {_gh_error_message(result)}")
+
+    username = result.stdout.strip()
+    if not username:
+        raise ValueError("Failed to resolve GitHub username from gh auth context")
+    return username
+
+
+def fetch_copilot_usage_report(
+    *,
+    username: str | None = None,
+    org: str | None = None,
+    year: int | None = None,
+    month: int | None = None,
+    day: int | None = None,
+    model: str | None = None,
+    product: str | None = None,
+) -> dict[str, Any]:
+    resolved_username = username.strip() if isinstance(username, str) else ""
+    resolved_org = org.strip() if isinstance(org, str) else ""
+    if not resolved_username and not resolved_org:
+        resolved_username = resolve_gh_authenticated_username()
+
+    endpoint = build_copilot_usage_endpoint(
+        username=resolved_username or None,
+        org=resolved_org or None,
+    )
+    args = build_copilot_usage_gh_args(
+        endpoint,
+        year=year,
+        month=month,
+        day=day,
+        model=model.strip() if isinstance(model, str) and model.strip() else None,
+        product=(
+            product.strip() if isinstance(product, str) and product.strip() else None
+        ),
+    )
+    return _gh_json_output(args)
+
+
+def _coerce_usage_float(value: Any) -> float:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+def summarize_copilot_usage_report(report: dict[str, Any]) -> dict[str, float | int]:
+    raw_items = report.get("usageItems")
+    items = raw_items if isinstance(raw_items, list) else []
+    totals: dict[str, float | int] = {
+        "gross_quantity": 0,
+        "discount_quantity": 0,
+        "net_quantity": 0,
+        "gross_amount": 0.0,
+        "discount_amount": 0.0,
+        "net_amount": 0.0,
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        totals["gross_quantity"] += _coerce_usage_int(item.get("grossQuantity"))
+        totals["discount_quantity"] += _coerce_usage_int(
+            item.get("discountQuantity")
+        )
+        totals["net_quantity"] += _coerce_usage_int(item.get("netQuantity"))
+        totals["gross_amount"] += _coerce_usage_float(item.get("grossAmount"))
+        totals["discount_amount"] += _coerce_usage_float(item.get("discountAmount"))
+        totals["net_amount"] += _coerce_usage_float(item.get("netAmount"))
+    return totals
+
+
+def _format_number(value: Any) -> str:
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, int):
+        return _format_int(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return _format_int(int(value))
+        return f"{value:,.2f}"
+    return ""
+
+
+def _format_currency(value: Any) -> str:
+    amount = _coerce_usage_float(value)
+    return f"${amount:,.2f}"
+
+
+def format_copilot_usage_time_period(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    year = value.get("year")
+    month = value.get("month")
+    day = value.get("day")
+    if isinstance(year, (int, float)) and isinstance(month, (int, float)):
+        if isinstance(day, (int, float)):
+            return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        return f"{int(year):04d}-{int(month):02d}"
+    if isinstance(year, (int, float)):
+        return str(int(year))
+    return ""
+
+
+def render_copilot_usage_report(report: dict[str, Any]) -> None:
+    console = Console()
+    raw_items = report.get("usageItems")
+    items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+    summary = summarize_copilot_usage_report(report)
+
+    details = Table(show_header=False, box=None, pad_edge=False)
+    details.add_column(style="bold cyan")
+    details.add_column()
+
+    user = report.get("user")
+    organization = report.get("organization")
+    if isinstance(user, str) and user.strip():
+        details.add_row("User", user)
+    elif isinstance(organization, str) and organization.strip():
+        details.add_row("Organization", organization)
+
+    period = format_copilot_usage_time_period(report.get("timePeriod"))
+    if period:
+        details.add_row("Period", period)
+
+    details.add_row("Usage items", _format_int(len(items)))
+    details.add_row("Net requests", _format_number(summary["net_quantity"]))
+    details.add_row("Net billed", _format_currency(summary["net_amount"]))
+    if summary["discount_quantity"] or summary["discount_amount"]:
+        details.add_row(
+            "Discounts",
+            f"{_format_number(summary['discount_quantity'])} / {_format_currency(summary['discount_amount'])}",
+        )
+    console.print(details)
+
+    if not items:
+        console.print("No Copilot premium request usage returned.")
+        return
+
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Model", style="green")
+    table.add_column("Unit")
+    table.add_column("Gross reqs", justify="right")
+    table.add_column("Discount reqs", justify="right")
+    table.add_column("Net reqs", justify="right")
+    table.add_column("Unit price", justify="right")
+    table.add_column("Net billed", justify="right")
+
+    for item in items:
+        table.add_row(
+            str(item.get("model") or ""),
+            str(item.get("unitType") or ""),
+            _format_number(item.get("grossQuantity")),
+            _format_number(item.get("discountQuantity")),
+            _format_number(item.get("netQuantity")),
+            _format_currency(item.get("pricePerUnit")),
+            _format_currency(item.get("netAmount")),
+        )
+
+    table.add_section()
+    table.add_row(
+        "Total",
+        "",
+        _format_number(summary["gross_quantity"]),
+        _format_number(summary["discount_quantity"]),
+        _format_number(summary["net_quantity"]),
+        "",
+        _format_currency(summary["net_amount"]),
+    )
     console.print(table)
 
 
@@ -3844,6 +4105,82 @@ def self_test_copilot_headers() -> None:
     _assert_true("X-Request-Id" in api_headers, "api headers should include request id")
 
 
+def self_test_build_copilot_usage_endpoint() -> None:
+    _assert_equal(
+        build_copilot_usage_endpoint(username="monalisa"),
+        "/users/monalisa/settings/billing/premium_request/usage",
+    )
+    _assert_equal(
+        build_copilot_usage_endpoint(org="github"),
+        "/organizations/github/settings/billing/premium_request/usage",
+    )
+    try:
+        build_copilot_usage_endpoint(username="monalisa", org="github")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("usage endpoint should reject both username and org")
+
+
+def self_test_build_copilot_usage_gh_args() -> None:
+    args = build_copilot_usage_gh_args(
+        "/users/monalisa/settings/billing/premium_request/usage",
+        year=2026,
+        month=4,
+        day=7,
+        model="gpt-5",
+        product="copilot",
+    )
+    _assert_equal(args[:6], [
+        "api",
+        "/users/monalisa/settings/billing/premium_request/usage",
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
+    ])
+    _assert_true(
+        f"X-GitHub-Api-Version: {GITHUB_REST_API_VERSION}" in args,
+        "usage command should include a GitHub API version header",
+    )
+    _assert_true("year=2026" in args, "usage command should pass year")
+    _assert_true("month=4" in args, "usage command should pass month")
+    _assert_true("day=7" in args, "usage command should pass day")
+    _assert_true("model=gpt-5" in args, "usage command should pass model")
+    _assert_true("product=copilot" in args, "usage command should pass product")
+
+
+def self_test_summarize_copilot_usage_report() -> None:
+    summary = summarize_copilot_usage_report(
+        {
+            "usageItems": [
+                {
+                    "grossQuantity": 100,
+                    "discountQuantity": 5,
+                    "netQuantity": 95,
+                    "grossAmount": 4,
+                    "discountAmount": 1,
+                    "netAmount": 3,
+                },
+                {
+                    "grossQuantity": 50,
+                    "discountQuantity": 0,
+                    "netQuantity": 50,
+                    "grossAmount": 2,
+                    "discountAmount": 0,
+                    "netAmount": 2,
+                },
+            ]
+        }
+    )
+    _assert_equal(summary["gross_quantity"], 150)
+    _assert_equal(summary["discount_quantity"], 5)
+    _assert_equal(summary["net_quantity"], 145)
+    _assert_equal(summary["gross_amount"], 6.0)
+    _assert_equal(summary["discount_amount"], 1.0)
+    _assert_equal(summary["net_amount"], 5.0)
+
+
 def self_test_apply_copilot_ephemeral_cache() -> None:
     global COPILOT_MODELS_CACHE
     global COPILOT_MODELS_CACHE_EXPIRES_AT
@@ -4551,6 +4888,15 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
     SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
     SelfTestCase("copilot_headers", self_test_copilot_headers),
+    SelfTestCase(
+        "build_copilot_usage_endpoint", self_test_build_copilot_usage_endpoint
+    ),
+    SelfTestCase(
+        "build_copilot_usage_gh_args", self_test_build_copilot_usage_gh_args
+    ),
+    SelfTestCase(
+        "summarize_copilot_usage_report", self_test_summarize_copilot_usage_report
+    ),
     SelfTestCase(
         "apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache
     ),
@@ -6049,6 +6395,53 @@ def models_command(
         raise click.ClickException(str(exc)) from exc
     except httpx.HTTPError as exc:
         raise click.ClickException(f"Failed to list models: {exc}") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cast(Any, main).group(name="copilot")
+def copilot_group() -> None:
+    """GitHub Copilot helpers."""
+
+
+@copilot_group.command(name="usage")
+@click.option("--username", default=None, help="GitHub username to query")
+@click.option("--org", default=None, help="GitHub organization to query")
+@click.option("--year", type=int, default=None, help="Billing year to query")
+@click.option("--month", type=int, default=None, help="Billing month to query")
+@click.option("--day", type=int, default=None, help="Billing day to query")
+@click.option("--model", default=None, help="Filter by model name")
+@click.option("--product", default=None, help="Filter by product name")
+def copilot_usage_command(
+    username: str | None,
+    org: str | None,
+    year: int | None,
+    month: int | None,
+    day: int | None,
+    model: str | None,
+    product: str | None,
+) -> None:
+    """Show Copilot premium request usage via gh api."""
+    if username and org:
+        raise click.UsageError("Use either --username or --org, not both.")
+    if year is not None and year < 0:
+        raise click.UsageError("--year must be a positive integer")
+    if month is not None and not 1 <= month <= 12:
+        raise click.UsageError("--month must be between 1 and 12")
+    if day is not None and not 1 <= day <= 31:
+        raise click.UsageError("--day must be between 1 and 31")
+
+    try:
+        report = fetch_copilot_usage_report(
+            username=username,
+            org=org,
+            year=year,
+            month=month,
+            day=day,
+            model=model,
+            product=product,
+        )
+        render_copilot_usage_report(report)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
