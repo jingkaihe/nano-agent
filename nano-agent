@@ -38,7 +38,6 @@ import json
 import os
 import platform
 import re
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1734,7 +1733,7 @@ Banned commands:
 - cd
 
 # Input
-- command: required single-line bash command
+- command: required bash command
 - description: required, 5-10 words
 - timeout: required, 10-120
 
@@ -1979,7 +1978,10 @@ def bash_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "The bash command to run"},
+            "command": {
+                "type": "string",
+                "description": "The bash command to run",
+            },
             "description": {
                 "type": "string",
                 "description": "A description of the command to run",
@@ -2694,21 +2696,21 @@ def validate_bash_args(
 ) -> tuple[str, str, int]:
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command is required")
-    if "\n" in command or "\r" in command:
-        raise ValueError("command must be single-line")
+    command = command.replace("\r\n", "\n").replace("\r", "\n")
     if not isinstance(description, str) or not description.strip():
         raise ValueError("description is required")
     if not isinstance(timeout, int) or timeout < 10 or timeout > 120:
         raise ValueError("timeout must be between 10 and 120 seconds")
 
-    for part in re.split(r"&&|\|\||;", command):
+    # Keep bash validation intentionally shallow: enforce required fields and
+    # banned top-level commands, but let bash itself handle shell syntax.
+    # Deep parsing here caused false positives for quoted strings like
+    # `"a && b"` and rejected multiline commands unnecessarily.
+    for part in re.split(r"&&|\|\||[;&|\n]", command):
         part = part.strip()
         if not part:
             continue
-        try:
-            tokens = shlex.split(part)
-        except ValueError as exc:
-            raise ValueError(f"invalid shell syntax: {exc}") from exc
+        tokens = part.split()
         if not tokens:
             continue
         if tokens[0] in BANNED_COMMANDS:
@@ -3530,8 +3532,8 @@ def truncate_middle_by_bytes_estimate(
     )
     prefix = content[:prefix_end]
     suffix = content[suffix_start:]
-    removed_bytes = content_bytes - len(prefix.encode("utf-8")) - len(
-        suffix.encode("utf-8")
+    removed_bytes = (
+        content_bytes - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8"))
     )
     marker = format_bash_truncation_marker(
         use_tokens,
@@ -3698,6 +3700,39 @@ def self_test_parse_tool_call_arguments() -> None:
     except ValueError:
         return
     raise AssertionError("parse_tool_call_arguments should reject non-object JSON")
+
+
+def self_test_validate_bash_args_accepts_quoted_operators() -> None:
+    command = 'printf "%s\\n" "a && b" && pwd'
+    validated, description, timeout = validate_bash_args(
+        command,
+        "accept quoted operators",
+        10,
+    )
+    _assert_equal(validated, command)
+    _assert_equal(description, "accept quoted operators")
+    _assert_equal(timeout, 10)
+
+
+def self_test_validate_bash_args_accepts_multiline_commands() -> None:
+    command = "printf 'hello\\n'\npwd"
+    validated, description, timeout = validate_bash_args(
+        command,
+        "accept multiline commands",
+        10,
+    )
+    _assert_equal(validated, command)
+    _assert_equal(description, "accept multiline commands")
+    _assert_equal(timeout, 10)
+
+
+def self_test_validate_bash_args_rejects_banned_commands() -> None:
+    try:
+        validate_bash_args("echo hi\nless file.txt", "reject banned commands", 10)
+    except ValueError as exc:
+        _assert_equal(str(exc), "command is banned: less")
+        return
+    raise AssertionError("validate_bash_args should reject banned commands")
 
 
 def self_test_apply_patch_roundtrip() -> None:
@@ -4546,6 +4581,18 @@ SELF_TESTS: list[SelfTestCase] = [
         "latest_conversation_session_id", self_test_latest_conversation_session_id
     ),
     SelfTestCase("parse_tool_call_arguments", self_test_parse_tool_call_arguments),
+    SelfTestCase(
+        "validate_bash_args_accepts_quoted_operators",
+        self_test_validate_bash_args_accepts_quoted_operators,
+    ),
+    SelfTestCase(
+        "validate_bash_args_accepts_multiline_commands",
+        self_test_validate_bash_args_accepts_multiline_commands,
+    ),
+    SelfTestCase(
+        "validate_bash_args_rejects_banned_commands",
+        self_test_validate_bash_args_rejects_banned_commands,
+    ),
     SelfTestCase("apply_patch_roundtrip", self_test_apply_patch_roundtrip),
     SelfTestCase("apply_patch_absolute_paths", self_test_apply_patch_absolute_paths),
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
