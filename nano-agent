@@ -6,6 +6,7 @@
 #   "openai>=1.68.2",
 #   "anthropic>=0.82.0",
 #   "httpx>=0.28.1",
+#   "Pillow>=10.4.0",
 #   "prompt_toolkit>=3.0.47",
 #   "PyYAML>=6.0.2",
 #   "markdownify>=0.13.1",
@@ -32,9 +33,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import inspect
 import json
+import math
+import mimetypes
 import os
 import platform
 import re
@@ -60,6 +64,7 @@ from jinja2 import Environment, StrictUndefined
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
+from PIL import Image
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
@@ -89,6 +94,8 @@ BANNED_COMMANDS = {"vim", "view", "less", "more", "cd"}
 MAX_TOOL_OUTPUT_BYTES = 32 * 1024
 BASH_MAX_OUTPUT_TOKENS = 10_000
 BASH_APPROX_BYTES_PER_TOKEN = 4
+VIEW_IMAGE_MAX_WIDTH = 2048
+VIEW_IMAGE_MAX_HEIGHT = 768
 ARCHIVE_DIR = Path.home() / ".nano-agent" / "web-archives"
 HISTORY_DIR = Path.home() / ".nano-agent" / "history"
 MODELS_CACHE_TTL_SECONDS = 300
@@ -114,8 +121,15 @@ ALL_TOOL_NAMES = (
     "glob",
     "skill",
     "web_fetch",
+    "view_image",
 )
-DEFAULT_RESPONSE_TOOL_NAMES = ["bash", "apply_patch", "skill", "web_fetch"]
+DEFAULT_RESPONSE_TOOL_NAMES = [
+    "bash",
+    "apply_patch",
+    "skill",
+    "web_fetch",
+    "view_image",
+]
 DEFAULT_CHAT_TOOL_NAMES = [
     "bash",
     "read_file",
@@ -125,6 +139,7 @@ DEFAULT_CHAT_TOOL_NAMES = [
     "glob",
     "skill",
     "web_fetch",
+    "view_image",
 ]
 
 
@@ -337,6 +352,19 @@ class ChatUI:
                 rows.append(("Extracted", "yes"))
             return rows
 
+        if name == "view_image":
+            rows.append(("Path", str(result.get("path") or "")))
+            mime_type = str(result.get("mime_type") or "")
+            if mime_type:
+                rows.append(("Type", mime_type))
+            width = result.get("width")
+            height = result.get("height")
+            if isinstance(width, int) and isinstance(height, int):
+                rows.append(("Size", f"{width}x{height}"))
+            if result.get("detail"):
+                rows.append(("Detail", str(result.get("detail"))))
+            return rows
+
         if name == "skill":
             rows.append(("Skill", str(result.get("skill_name") or "")))
             rows.append(("Directory", str(result.get("directory") or "")))
@@ -395,6 +423,9 @@ class ChatUI:
                 if content
                 else None
             )
+
+        if name == "view_image":
+            return None
 
         return None
 
@@ -1974,6 +2005,18 @@ Examples:
     ).render()
 
 
+def view_image_description(model: str) -> str:
+    detail_text = (
+        "The optional `detail` field is available for this model and supports only `original`. Use it when high-fidelity image perception or precise localization is needed."
+        if supports_view_image_original_detail(model)
+        else "This model does not support the optional `detail` field; omit it."
+    )
+    return (
+        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached in the conversation context).\n\n"
+        + detail_text
+    )
+
+
 def bash_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -2163,6 +2206,223 @@ def web_fetch_schema() -> dict[str, Any]:
         "required": ["url"],
         "additionalProperties": False,
     }
+
+
+def view_image_schema(model: str) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "path": {
+            "type": "string",
+            "description": "Local filesystem path to an image file. Absolute paths are preferred.",
+        }
+    }
+    if supports_view_image_original_detail(model):
+        properties["detail"] = {
+            "type": "string",
+            "description": "Optional detail override. The only supported value is `original`; omit this field for default resized behavior.",
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+
+def supports_view_image_original_detail(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized == "gpt-5.3-codex"
+
+
+def supports_image_inputs(provider: str, model: str) -> bool:
+    normalized_provider = provider.strip().lower()
+    if normalized_provider == "copilot":
+        try:
+            entry = _model_catalog_entry(model, provider=provider)
+        except Exception:
+            entry = None
+        capabilities = (
+            entry.get("capabilities")
+            if isinstance(entry, dict) and isinstance(entry.get("capabilities"), dict)
+            else {}
+        )
+        inputs = (
+            capabilities.get("input_modalities")
+            if isinstance(capabilities, dict)
+            else None
+        )
+        if isinstance(inputs, list) and inputs:
+            return any(
+                isinstance(item, str) and item.strip().lower() == "image"
+                for item in inputs
+            )
+    return True
+
+
+def _guess_supported_image_mime(path: Path, image: Image.Image) -> str:
+    guessed, _ = mimetypes.guess_type(str(path))
+    if guessed in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+        return guessed
+    image_format = (image.format or "").upper()
+    if image_format == "PNG":
+        return "image/png"
+    if image_format in {"JPEG", "JPG"}:
+        return "image/jpeg"
+    if image_format == "WEBP":
+        return "image/webp"
+    if image_format == "GIF":
+        return "image/gif"
+    return "image/png"
+
+
+def _image_output_format_for_mime(mime_type: str) -> str:
+    if mime_type == "image/jpeg":
+        return "JPEG"
+    if mime_type == "image/webp":
+        return "WEBP"
+    if mime_type == "image/gif":
+        return "GIF"
+    return "PNG"
+
+
+def _image_data_url(mime_type: str, data: bytes) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _data_url_to_anthropic_source(data_url: str) -> dict[str, Any]:
+    if not isinstance(data_url, str) or not data_url.startswith("data:"):
+        raise ValueError("image_url must be a data URL")
+    header, encoded = data_url.split(",", 1)
+    if ";base64" not in header:
+        raise ValueError("image_url data URL must be base64-encoded")
+    mime_type = header[5:].split(";", 1)[0].strip().lower()
+    if mime_type not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+        raise ValueError(f"unsupported image mime type for Anthropic: {mime_type}")
+    return {"type": "base64", "media_type": mime_type, "data": encoded}
+
+
+def make_view_image_result(
+    path: Path,
+    *,
+    detail: str | None,
+    model: str,
+    provider: str,
+) -> dict[str, Any]:
+    if not supports_image_inputs(provider, model):
+        raise ValueError(
+            "view_image is not allowed because the current model may not support image inputs"
+        )
+
+    normalized_detail = detail.strip() if isinstance(detail, str) else None
+    if normalized_detail == "":
+        normalized_detail = None
+    if normalized_detail is not None and normalized_detail != "original":
+        raise ValueError(
+            "view_image.detail only supports `original`; omit `detail` for default resized behavior, got "
+            + repr(normalized_detail)
+        )
+    if normalized_detail == "original" and not supports_view_image_original_detail(
+        model
+    ):
+        raise ValueError(
+            "view_image.detail only supports `original` on compatible models; omit `detail` for default resized behavior"
+        )
+
+    if not path.exists():
+        raise ValueError(f"unable to locate image at `{path}`")
+    if not path.is_file():
+        raise ValueError(f"image path `{path}` is not a file")
+
+    file_bytes = path.read_bytes()
+    try:
+        with Image.open(path) as source_image:
+            source_image.load()
+            mime_type = _guess_supported_image_mime(path, source_image)
+            original_width, original_height = source_image.size
+            use_original = normalized_detail == "original"
+            output_image = source_image
+            output_width, output_height = original_width, original_height
+            if not use_original and (
+                original_width > VIEW_IMAGE_MAX_WIDTH
+                or original_height > VIEW_IMAGE_MAX_HEIGHT
+            ):
+                scale = min(
+                    VIEW_IMAGE_MAX_WIDTH / original_width,
+                    VIEW_IMAGE_MAX_HEIGHT / original_height,
+                )
+                output_width = max(1, int(math.floor(original_width * scale)))
+                output_height = max(1, int(math.floor(original_height * scale)))
+                output_image = source_image.resize(
+                    (output_width, output_height), resample=Image.Resampling.BILINEAR
+                )
+            elif use_original or mime_type in {"image/png", "image/jpeg", "image/webp"}:
+                return {
+                    "success": True,
+                    "path": str(path),
+                    "image_url": _image_data_url(mime_type, file_bytes),
+                    "detail": "original" if use_original else None,
+                    "mime_type": mime_type,
+                    "width": original_width,
+                    "height": original_height,
+                }
+
+            from io import BytesIO
+
+            buffer = BytesIO()
+            output_format = _image_output_format_for_mime(mime_type)
+            save_kwargs: dict[str, Any] = {}
+            if output_format == "JPEG":
+                save_kwargs["quality"] = 85
+                if output_image.mode not in {"RGB", "L"}:
+                    output_image = output_image.convert("RGB")
+            output_image.save(buffer, format=output_format, **save_kwargs)
+            data = buffer.getvalue()
+            return {
+                "success": True,
+                "path": str(path),
+                "image_url": _image_data_url(mime_type, data),
+                "detail": "original" if use_original else None,
+                "mime_type": mime_type,
+                "width": output_width,
+                "height": output_height,
+            }
+    except ValueError:
+        raise
+    except Exception as exc:
+        mime_type, _ = mimetypes.guess_type(str(path))
+        mime_label = mime_type or "unknown"
+        raise ValueError(
+            f"unable to process image at `{path}`: unsupported image `{mime_label}`"
+        ) from exc
+
+
+def tool_result_content_parts(result: dict[str, Any]) -> list[dict[str, Any]] | None:
+    if (
+        result.get("success")
+        and isinstance(result.get("image_url"), str)
+        and result.get("image_url")
+    ):
+        image_part: dict[str, Any] = {
+            "type": "input_image",
+            "image_url": result["image_url"],
+        }
+        if result.get("detail") == "original":
+            image_part["detail"] = "original"
+        return [image_part]
+    return None
+
+
+def chat_tool_message_content(result: dict[str, Any]) -> str | list[dict[str, Any]]:
+    return tool_result_content(result, include_image_url=False)
+
+
+def responses_function_call_output(
+    result: dict[str, Any],
+) -> str | list[dict[str, Any]]:
+    parts = tool_result_content_parts(result)
+    if parts is not None:
+        return parts
+    return tool_result_content(result)
 
 
 def _to_plain_data(value: Any) -> Any:
@@ -2624,6 +2884,42 @@ def build_anthropic_messages(
         if role == "tool":
             tool_call_id = message.get("tool_call_id")
             content = message.get("content")
+            if isinstance(content, list):
+                tool_result_blocks: list[dict[str, Any]] = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "input_image":
+                        image_url = item.get("image_url")
+                        if isinstance(image_url, str) and image_url:
+                            tool_result_blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": _data_url_to_anthropic_source(image_url),
+                                }
+                            )
+                    elif item_type == "text":
+                        text = item.get("text")
+                        if isinstance(text, str):
+                            tool_result_blocks.append({"type": "text", "text": text})
+                if tool_result_blocks:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                _apply_copilot_cache_control_to_block(
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_call_id or "",
+                                        "content": tool_result_blocks,
+                                    },
+                                    _copilot_cache_control(message),
+                                )
+                            ],
+                        }
+                    )
+                    continue
             anthropic_messages.append(
                 {
                     "role": "user",
@@ -3870,6 +4166,136 @@ def self_test_build_anthropic_messages() -> None:
         "ephemeral",
     )
 
+    image_data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+    _system, image_messages = build_anthropic_messages(
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "call-image",
+                "content": [{"type": "input_image", "image_url": image_data_url}],
+            }
+        ]
+    )
+    tool_result = image_messages[0]["content"][0]
+    _assert_equal(tool_result["type"], "tool_result")
+    image_block = tool_result["content"][0]
+    _assert_equal(image_block["type"], "image")
+    _assert_equal(image_block["source"]["media_type"], "image/png")
+
+
+def self_test_view_image_schema_and_helpers() -> None:
+    basic_schema = view_image_schema("gpt-5")
+    _assert_true(
+        "detail" not in cast(dict[str, Any], basic_schema["properties"]),
+        "non-supported models should omit detail from view_image schema",
+    )
+
+    codex_schema = view_image_schema("gpt-5.3-codex")
+    _assert_true(
+        "detail" in cast(dict[str, Any], codex_schema["properties"]),
+        "gpt-5.3-codex should expose detail in view_image schema",
+    )
+
+    image_result = {
+        "success": True,
+        "path": "/tmp/test.png",
+        "image_url": "data:image/png;base64,AAA",
+        "detail": "original",
+    }
+    response_output = responses_function_call_output(image_result)
+    _assert_true(
+        isinstance(response_output, list), "responses output should allow image parts"
+    )
+    response_parts = cast(list[dict[str, Any]], response_output)
+    _assert_equal(response_parts[0]["type"], "input_image")
+    _assert_equal(response_parts[0]["detail"], "original")
+
+    chat_content = chat_tool_message_content(image_result)
+    _assert_true(isinstance(chat_content, str), "chat tool content should stay textual")
+    _assert_true(
+        "[omitted data URL]" in cast(str, chat_content),
+        "chat tool content should elide the data URL",
+    )
+
+    followup = chat_followup_image_message(image_result)
+    _assert_true(
+        followup is not None,
+        "chat completions should synthesize a follow-up image message",
+    )
+    followup_message = cast(dict[str, Any], followup)
+    content = cast(list[dict[str, Any]], followup_message["content"])
+    _assert_equal(content[0]["type"], "image_url")
+    _assert_equal(content[0]["image_url"]["detail"], "high")
+
+    anthropic_source = _data_url_to_anthropic_source(image_result["image_url"])
+    _assert_equal(anthropic_source["type"], "base64")
+    _assert_equal(anthropic_source["media_type"], "image/png")
+
+
+def self_test_view_image_roundtrip() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        image_path = Path(tmp) / "example.png"
+        Image.new("RGBA", (2304, 864), (255, 0, 0, 255)).save(image_path, format="PNG")
+
+        resized = make_view_image_result(
+            image_path,
+            detail=None,
+            model="gpt-5",
+            provider="openai",
+        )
+        _assert_equal(resized["mime_type"], "image/png")
+        _assert_true(
+            resized["width"] <= VIEW_IMAGE_MAX_WIDTH, "resized width should be bounded"
+        )
+        _assert_true(
+            resized["height"] <= VIEW_IMAGE_MAX_HEIGHT,
+            "resized height should be bounded",
+        )
+        _assert_true(resized["width"] < 2304, "resized image should shrink width")
+        _assert_equal(resized.get("detail"), None)
+
+        original = make_view_image_result(
+            image_path,
+            detail="original",
+            model="gpt-5.3-codex",
+            provider="openai",
+        )
+        _assert_equal(original["width"], 2304)
+        _assert_equal(original["height"], 864)
+        _assert_equal(original["detail"], "original")
+
+        try:
+            make_view_image_result(
+                image_path,
+                detail="low",
+                model="gpt-5.3-codex",
+                provider="openai",
+            )
+        except ValueError as exc:
+            _assert_true(
+                "only supports `original`" in str(exc),
+                "unsupported detail should produce a clear error",
+            )
+        else:
+            raise AssertionError("view_image should reject unsupported detail values")
+
+        text_path = Path(tmp) / "example.json"
+        text_path.write_text('{"hello": true}')
+        try:
+            make_view_image_result(
+                text_path,
+                detail=None,
+                model="gpt-5",
+                provider="openai",
+            )
+        except ValueError as exc:
+            _assert_true(
+                "unsupported image" in str(exc),
+                "non-image files should produce an unsupported image error",
+            )
+        else:
+            raise AssertionError("view_image should reject non-image files")
+
 
 def self_test_copilot_headers() -> None:
     exchange_headers = copilot_token_exchange_headers("token")
@@ -4528,6 +4954,26 @@ def self_test_tool_specs_respect_allowed_tools() -> None:
         asyncio.run(agent.close())
 
 
+def self_test_tool_specs_include_view_image_when_enabled() -> None:
+    agent = NanoAgent(
+        model="gpt-5.3-codex",
+        cwd=Path.cwd(),
+        provider="openai",
+        api_key="test",
+        allowed_tools=["view_image"],
+    )
+    try:
+        specs = agent.tool_specs()
+        _assert_equal(specs[0]["function"]["name"], "view_image")
+        properties = specs[0]["function"]["parameters"]["properties"]
+        _assert_true(
+            "detail" in properties,
+            "gpt-5.3-codex view_image tool should expose detail",
+        )
+    finally:
+        asyncio.run(agent.close())
+
+
 def self_test_file_tool_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
@@ -4597,6 +5043,10 @@ SELF_TESTS: list[SelfTestCase] = [
     SelfTestCase("apply_patch_absolute_paths", self_test_apply_patch_absolute_paths),
     SelfTestCase("validate_fetch_url", self_test_validate_fetch_url),
     SelfTestCase("build_anthropic_messages", self_test_build_anthropic_messages),
+    SelfTestCase(
+        "view_image_schema_and_helpers", self_test_view_image_schema_and_helpers
+    ),
+    SelfTestCase("view_image_roundtrip", self_test_view_image_roundtrip),
     SelfTestCase("copilot_headers", self_test_copilot_headers),
     SelfTestCase(
         "apply_copilot_ephemeral_cache", self_test_apply_copilot_ephemeral_cache
@@ -4653,6 +5103,10 @@ SELF_TESTS: list[SelfTestCase] = [
         "tool_specs_respect_allowed_tools",
         self_test_tool_specs_respect_allowed_tools,
     ),
+    SelfTestCase(
+        "tool_specs_include_view_image_when_enabled",
+        self_test_tool_specs_include_view_image_when_enabled,
+    ),
     SelfTestCase("file_tool_roundtrip", self_test_file_tool_roundtrip),
     SelfTestCase("search_tools_roundtrip", self_test_search_tools_roundtrip),
 ]
@@ -4698,8 +5152,37 @@ def parse_tool_call_arguments(arguments: str | None) -> dict[str, Any]:
     return parsed
 
 
-def tool_result_content(result: dict[str, Any]) -> str:
-    return json.dumps(result, ensure_ascii=False)
+def tool_result_content(
+    result: dict[str, Any], *, include_image_url: bool = True
+) -> str:
+    payload = dict(result)
+    if not include_image_url and isinstance(payload.get("image_url"), str):
+        payload["image_url"] = "[omitted data URL]"
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _tool_result_message_content(
+    result: dict[str, Any], *, role: str, api: str
+) -> str | list[dict[str, Any]]:
+    if role == "tool" and api == "chat.completions":
+        return chat_tool_message_content(result)
+    return tool_result_content(result)
+
+
+def chat_followup_image_message(result: dict[str, Any]) -> dict[str, Any] | None:
+    image_url = result.get("image_url")
+    if not (result.get("success") and isinstance(image_url, str) and image_url):
+        return None
+    detail = "high" if result.get("detail") == "original" else "auto"
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": image_url, "detail": detail},
+            }
+        ],
+    }
 
 
 @dataclass
@@ -4973,20 +5456,26 @@ class NanoAgent:
                 result = await self.run_tool(call["function"]["name"], args)
 
             self.ui.show_tool_result(call["function"]["name"], result)
-            tool_content = tool_result_content(result)
             tool_call_id = call[call_id_key]
+            chat_tool_content = _tool_result_message_content(
+                result, role="tool", api="chat.completions"
+            )
             self.messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": tool_content,
+                    "content": chat_tool_content,
                 }
             )
+            followup_chat_message = chat_followup_image_message(result)
+            if followup_chat_message is not None:
+                self.messages.append(followup_chat_message)
+            response_output = responses_function_call_output(result)
             tool_outputs.append(
                 {
                     "type": "function_call_output",
                     "call_id": tool_call_id,
-                    "output": tool_content,
+                    "output": response_output,
                 }
             )
 
@@ -5077,6 +5566,10 @@ class NanoAgent:
             "glob": (glob_description(), glob_schema()),
             "skill": (skill_description(self.current_skills()), skill_schema()),
             "web_fetch": (web_fetch_description(), web_fetch_schema()),
+            "view_image": (
+                view_image_description(self.model),
+                view_image_schema(self.model),
+            ),
         }
         specs: list[dict[str, Any]] = []
         for name in self.active_tool_names():
@@ -5621,6 +6114,26 @@ The skill directory is located at: {skill.directory}
                         "content": extracted,
                     }
                 return {"success": True, "url": raw_url, "content": markdown}
+
+            if name == "view_image":
+                raw_path = arguments.get("path")
+                detail = arguments.get("detail")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    raise ValueError("path is required")
+                if detail is not None and not isinstance(detail, str):
+                    raise ValueError("detail must be a string when provided")
+                candidate = Path(raw_path.strip())
+                resolved = (
+                    candidate.resolve()
+                    if candidate.is_absolute()
+                    else (self.cwd / candidate).resolve()
+                )
+                return make_view_image_result(
+                    resolved,
+                    detail=detail,
+                    model=self.model,
+                    provider=self.provider,
+                )
 
             raise ValueError(f"unknown tool: {name}")
         except Exception as exc:

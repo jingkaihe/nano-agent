@@ -12,7 +12,7 @@ Use the executable directly from the repo root:
 - `./nano-agent self-test`: run the built-in regression checks.
 - `uvx ruff check nano-agent`: run linting without requiring a global `ruff` install.
 - `uvx ruff format nano-agent`: apply consistent formatting with Ruff.
-- `uvx --with click --with openai --with anthropic --with httpx --with prompt_toolkit --with PyYAML --with markdownify --with Jinja2 --with rich ty check nano-agent`: run static type checks with `ty` in a `uvx` environment that matches the script header dependencies.
+- `uvx --with click --with openai --with anthropic --with httpx --with Pillow --with prompt_toolkit --with PyYAML --with markdownify --with Jinja2 --with rich ty check nano-agent`: run static type checks with `ty` in a `uvx` environment that matches the script header dependencies.
 
 ## Coding Style & Naming Conventions
 Target Python 3.11+ and add dependencies only in the script header’s `# dependencies = [...]` block. Follow the existing style: 4-space indentation, `snake_case` for functions, variables, and helpers, `PascalCase` for classes/dataclasses, and explicit type hints on new code. Keep Click entrypoints thin; push parsing, validation, and API logic into focused helper functions.
