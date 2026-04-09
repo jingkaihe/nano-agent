@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Self-test, lint, and type-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Ensure nano-agent is executable
+        run: chmod +x ./nano-agent
+
+      - name: Run Ruff
+        run: uvx ruff check nano-agent
+
+      - name: Run ty
+        run: >-
+          uvx
+          --with click
+          --with openai
+          --with anthropic
+          --with httpx
+          --with Pillow
+          --with prompt_toolkit
+          --with PyYAML
+          --with markdownify
+          --with Jinja2
+          --with rich
+          ty check nano-agent
+
+      - name: Run self-tests
+        run: ./nano-agent self-test
