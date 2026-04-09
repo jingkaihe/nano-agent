@@ -2701,6 +2701,37 @@ def _apply_copilot_cache_control_to_block(
     return updated
 
 
+def _anthropic_block_from_internal_block(block: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(block)
+    existing = updated.pop("copilot_cache_control", None)
+    if isinstance(existing, dict):
+        existing_cache_control = updated.get("cache_control")
+        current_cache_control: dict[str, Any] = (
+            dict(existing_cache_control)
+            if isinstance(existing_cache_control, dict)
+            else {}
+        )
+        updated["cache_control"] = {
+            **current_cache_control,
+            **existing,
+        }
+    return updated
+
+
+def _apply_copilot_cache_control_to_anthropic_block(
+    block: dict[str, Any], cache_control: dict[str, Any] | None
+) -> dict[str, Any]:
+    updated = _anthropic_block_from_internal_block(block)
+    if cache_control is None:
+        return updated
+    existing = updated.get("cache_control")
+    updated["cache_control"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        **cache_control,
+    }
+    return updated
+
+
 def _apply_message_copilot_cache_control_to_last_block(
     blocks: list[dict[str, Any]], message: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -2709,6 +2740,19 @@ def _apply_message_copilot_cache_control_to_last_block(
         return blocks
     updated = list(blocks)
     updated[-1] = _apply_copilot_cache_control_to_block(updated[-1], cache_control)
+    return updated
+
+
+def _apply_message_copilot_cache_control_to_last_anthropic_block(
+    blocks: list[dict[str, Any]], message: dict[str, Any]
+) -> list[dict[str, Any]]:
+    updated = [_anthropic_block_from_internal_block(block) for block in blocks]
+    cache_control = _copilot_cache_control(message)
+    if cache_control is None or not updated:
+        return updated
+    updated[-1] = _apply_copilot_cache_control_to_anthropic_block(
+        updated[-1], cache_control
+    )
     return updated
 
 
@@ -2797,7 +2841,7 @@ def build_anthropic_messages(
             content = message.get("content")
             if isinstance(content, str) and content.strip():
                 system_blocks.append(
-                    _apply_copilot_cache_control_to_block(
+                    _apply_copilot_cache_control_to_anthropic_block(
                         {"type": "text", "text": content},
                         _copilot_cache_control(message),
                     )
@@ -2805,7 +2849,7 @@ def build_anthropic_messages(
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
-                        system_blocks.append(dict(item))
+                        system_blocks.append(_anthropic_block_from_internal_block(item))
             continue
 
         if role == "user":
@@ -2819,7 +2863,7 @@ def build_anthropic_messages(
                         {
                             "role": "user",
                             "content": [
-                                _apply_copilot_cache_control_to_block(
+                                _apply_copilot_cache_control_to_anthropic_block(
                                     {"type": "text", "text": content},
                                     cache_control,
                                 )
@@ -2831,7 +2875,11 @@ def build_anthropic_messages(
                     {
                         "role": "user",
                         "content": [
-                            dict(item) if isinstance(item, dict) else item
+                            (
+                                _anthropic_block_from_internal_block(item)
+                                if isinstance(item, dict)
+                                else item
+                            )
                             for item in content
                         ],
                     }
@@ -2846,7 +2894,7 @@ def build_anthropic_messages(
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
-                        blocks.append(item)
+                        blocks.append(_anthropic_block_from_internal_block(item))
 
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
@@ -2877,7 +2925,9 @@ def build_anthropic_messages(
                         }
                     )
 
-            blocks = _apply_message_copilot_cache_control_to_last_block(blocks, message)
+            blocks = _apply_message_copilot_cache_control_to_last_anthropic_block(
+                blocks, message
+            )
             anthropic_messages.append({"role": "assistant", "content": blocks or ""})
             continue
 
@@ -2908,7 +2958,7 @@ def build_anthropic_messages(
                         {
                             "role": "user",
                             "content": [
-                                _apply_copilot_cache_control_to_block(
+                                _apply_copilot_cache_control_to_anthropic_block(
                                     {
                                         "type": "tool_result",
                                         "tool_use_id": tool_call_id or "",
@@ -2924,7 +2974,7 @@ def build_anthropic_messages(
                 {
                     "role": "user",
                     "content": [
-                        _apply_copilot_cache_control_to_block(
+                        _apply_copilot_cache_control_to_anthropic_block(
                             {
                                 "type": "tool_result",
                                 "tool_use_id": tool_call_id or "",
@@ -4148,21 +4198,19 @@ def self_test_build_anthropic_messages() -> None:
     )
     cached_system_blocks = cast(list[dict[str, Any]], cached_system)
     _assert_equal(
-        cast(dict[str, Any], cached_system_blocks[0].get("copilot_cache_control")).get(
-            "type"
-        ),
+        cast(dict[str, Any], cached_system_blocks[0].get("cache_control")).get("type"),
         "ephemeral",
     )
     _assert_equal(
-        cached_messages[0]["content"][0]["copilot_cache_control"]["type"],
+        cached_messages[0]["content"][0]["cache_control"]["type"],
         "ephemeral",
     )
     _assert_equal(
-        cached_messages[1]["content"][-1]["copilot_cache_control"]["type"],
+        cached_messages[1]["content"][-1]["cache_control"]["type"],
         "ephemeral",
     )
     _assert_equal(
-        cached_messages[2]["content"][0]["copilot_cache_control"]["type"],
+        cached_messages[2]["content"][0]["cache_control"]["type"],
         "ephemeral",
     )
 
@@ -4974,6 +5022,64 @@ def self_test_tool_specs_include_view_image_when_enabled() -> None:
         asyncio.run(agent.close())
 
 
+def self_test_execute_tool_calls_only_adds_chat_followup_image_message() -> None:
+    async def _run() -> None:
+        class _FakeImageAgent(NanoAgent):
+            async def run_tool(
+                self, name: str, arguments: dict[str, Any]
+            ) -> dict[str, Any]:
+                _assert_equal(name, "view_image")
+                _assert_equal(arguments, {"path": "/tmp/demo.png"})
+                return {
+                    "success": True,
+                    "path": "/tmp/demo.png",
+                    "image_url": "data:image/png;base64,AAA",
+                    "mime_type": "image/png",
+                    "width": 10,
+                    "height": 10,
+                }
+
+        agent = _FakeImageAgent(
+            model="claude-haiku-4.5",
+            cwd=Path.cwd(),
+            provider="openai",
+            api_key="test",
+        )
+        try:
+            tool_call = {
+                "id": "call-1",
+                "function": {
+                    "name": "view_image",
+                    "arguments": '{"path":"/tmp/demo.png"}',
+                },
+            }
+
+            agent.messages = []
+            await agent.execute_tool_calls(
+                [tool_call], call_id_key="id", api="messages"
+            )
+            _assert_equal(len(agent.messages), 1)
+            _assert_equal(agent.messages[0]["role"], "tool")
+            _assert_true(
+                isinstance(agent.messages[0]["content"], list),
+                "anthropic tool result should keep structured image content",
+            )
+            _assert_equal(agent.messages[0]["content"][0]["type"], "input_image")
+
+            agent.messages = []
+            await agent.execute_tool_calls(
+                [tool_call], call_id_key="id", api="chat.completions"
+            )
+            _assert_equal(len(agent.messages), 2)
+            _assert_equal(agent.messages[0]["role"], "tool")
+            _assert_equal(agent.messages[1]["role"], "user")
+            _assert_equal(agent.messages[1]["content"][0]["type"], "image_url")
+        finally:
+            await agent.close()
+
+    asyncio.run(_run())
+
+
 def self_test_file_tool_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
@@ -5107,6 +5213,10 @@ SELF_TESTS: list[SelfTestCase] = [
         "tool_specs_include_view_image_when_enabled",
         self_test_tool_specs_include_view_image_when_enabled,
     ),
+    SelfTestCase(
+        "execute_tool_calls_only_adds_chat_followup_image_message",
+        self_test_execute_tool_calls_only_adds_chat_followup_image_message,
+    ),
     SelfTestCase("file_tool_roundtrip", self_test_file_tool_roundtrip),
     SelfTestCase("search_tools_roundtrip", self_test_search_tools_roundtrip),
 ]
@@ -5164,8 +5274,13 @@ def tool_result_content(
 def _tool_result_message_content(
     result: dict[str, Any], *, role: str, api: str
 ) -> str | list[dict[str, Any]]:
-    if role == "tool" and api == "chat.completions":
-        return chat_tool_message_content(result)
+    if role == "tool":
+        if api == "chat.completions":
+            return chat_tool_message_content(result)
+        if api == "messages":
+            parts = tool_result_content_parts(result)
+            if parts is not None:
+                return parts
     return tool_result_content(result)
 
 
@@ -5442,7 +5557,11 @@ class NanoAgent:
         )
 
     async def execute_tool_calls(
-        self, tool_calls: list[dict[str, Any]], *, call_id_key: str
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        call_id_key: str,
+        api: str,
     ) -> list[dict[str, Any]]:
         tool_outputs: list[dict[str, Any]] = []
         for call in tool_calls:
@@ -5457,17 +5576,21 @@ class NanoAgent:
 
             self.ui.show_tool_result(call["function"]["name"], result)
             tool_call_id = call[call_id_key]
-            chat_tool_content = _tool_result_message_content(
-                result, role="tool", api="chat.completions"
+            message_tool_content = _tool_result_message_content(
+                result, role="tool", api=api
             )
             self.messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": chat_tool_content,
+                    "content": message_tool_content,
                 }
             )
-            followup_chat_message = chat_followup_image_message(result)
+            followup_chat_message = (
+                chat_followup_image_message(result)
+                if api == "chat.completions"
+                else None
+            )
             if followup_chat_message is not None:
                 self.messages.append(followup_chat_message)
             response_output = responses_function_call_output(result)
@@ -5761,7 +5884,7 @@ class NanoAgent:
                 return
 
             tool_outputs = await self.execute_tool_calls(
-                turn.tool_calls, call_id_key="call_id"
+                turn.tool_calls, call_id_key="call_id", api="responses"
             )
             self.responses_items.extend(tool_outputs)
             initiator = "agent"
@@ -5852,7 +5975,9 @@ class NanoAgent:
             if not turn.tool_calls:
                 return
 
-            await self.execute_tool_calls(turn.tool_calls, call_id_key="id")
+            await self.execute_tool_calls(
+                turn.tool_calls, call_id_key="id", api="chat.completions"
+            )
             initiator = "agent"
 
     async def send_via_anthropic_messages(self, *, initiator: str = "agent") -> None:
@@ -5946,7 +6071,9 @@ class NanoAgent:
             if not turn.tool_calls:
                 return
 
-            await self.execute_tool_calls(turn.tool_calls, call_id_key="id")
+            await self.execute_tool_calls(
+                turn.tool_calls, call_id_key="id", api="messages"
+            )
             initiator = "agent"
 
     async def run_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
