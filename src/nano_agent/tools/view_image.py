@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import ToolCallContext, ToolDefinition
+from ._common import JINJA
 from ._images_impl import (
     _data_url_to_anthropic_source,
     make_view_image_result,
@@ -16,8 +17,37 @@ from .results import (
     responses_function_call_output,
     tool_result_content_parts,
 )
-from .descriptions import view_image_description
-from .schemas import view_image_schema
+
+
+def view_image_schema(model: str) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "path": {
+            "type": "string",
+            "description": "Local filesystem path to an image file. Absolute paths are preferred.",
+        }
+    }
+    if supports_view_image_original_detail(model):
+        properties["detail"] = {
+            "type": "string",
+            "description": "Optional detail override. The only supported value is `original`; omit this field for default resized behavior.",
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+
+def view_image_description(model: str) -> str:
+    detail_text = (
+        "The optional `detail` field is available for this model and supports only `original`. Use it when high-fidelity image perception or precise localization is needed."
+        if supports_view_image_original_detail(model)
+        else "This model does not support the optional `detail` field; omit it."
+    )
+    return JINJA.from_string(
+        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached in the conversation context).\n\n{{ detail_text }}"
+    ).render(detail_text=detail_text)
 
 
 class ViewImageTool(ToolDefinition):

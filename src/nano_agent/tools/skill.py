@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from ..core import skill_description
 from .base import ToolCallContext, ToolDefinition
-from .schemas import skill_schema
+
+
+class SkillArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str = Field(description="The name of the skill to invoke")
+
+
+def skill_schema() -> dict[str, Any]:
+    return SkillArgs.model_json_schema()
 
 
 class SkillTool(ToolDefinition):

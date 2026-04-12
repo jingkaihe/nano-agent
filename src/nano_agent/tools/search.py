@@ -6,12 +6,99 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from ._common import GLOB_MAX_RESULTS, GREP_MAX_LINE_LENGTH, GREP_MAX_OUTPUT_BYTES, GREP_MAX_RESULTS, SEARCH_TOOL_TIMEOUT_SECONDS
+from pydantic import BaseModel, ConfigDict, Field
+
+from ._common import GLOB_MAX_RESULTS, GREP_MAX_LINE_LENGTH, GREP_MAX_OUTPUT_BYTES, GREP_MAX_RESULTS, JINJA, SEARCH_TOOL_TIMEOUT_SECONDS
 from .base import ToolCallContext, ToolDefinition
 from .files import _ensure_absolute_path
-from .descriptions import glob_description, grep_description
 from ._output_impl import truncate_tool_output
-from .schemas import glob_schema, grep_schema
+
+
+class GrepArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str = Field(description="The pattern to search for")
+    path: str | None = Field(
+        default=None, description="Absolute file or directory path to search in"
+    )
+    include: str | None = Field(
+        default=None,
+        description="Optional glob to filter files when searching a directory",
+    )
+    ignore_case: bool | None = Field(
+        default=None, description="Case-insensitive search if true"
+    )
+    fixed_strings: bool | None = Field(
+        default=None, description="Treat pattern as a literal string if true"
+    )
+    surround_lines: int | None = Field(
+        default=None, description="Number of context lines before and after each match"
+    )
+    max_results: int | None = Field(
+        default=None,
+        description=f"Maximum number of files to return. Max: {GREP_MAX_RESULTS}",
+    )
+
+
+class GlobArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str = Field(description="The glob pattern to match files")
+    path: str | None = Field(
+        default=None, description="Absolute directory path to search in"
+    )
+    ignore_gitignore: bool | None = Field(
+        default=None, description="If true, do not respect .gitignore rules"
+    )
+
+
+def grep_schema() -> dict[str, Any]:
+    return GrepArgs.model_json_schema()
+
+
+def glob_schema() -> dict[str, Any]:
+    return GlobArgs.model_json_schema()
+
+
+def grep_description() -> str:
+    return JINJA.from_string(
+        f"""Search for a pattern in the codebase using regex.
+
+## Important Notes
+* Prefer this tool over raw grep/egrep shell commands for content search.
+* Files matching .gitignore patterns are automatically excluded by the underlying rg defaults.
+* Hidden files/directories (starting with .) are skipped by default for directory searches.
+* Results are sorted by modification time (newest first), returning at most {GREP_MAX_RESULTS} files by default.
+* To get the best result, use `glob` first to narrow the files and then use this tool for targeted content search.
+
+## Input
+- pattern: The pattern to search for (regex by default, or literal string if fixed_strings is true)
+- path: The absolute path to search in. Can be a directory or a single file. Defaults to the current working directory.
+- include: Optional glob pattern to filter files, for example `*.go` or `*.{{go,py}}`
+- ignore_case: If true, use case-insensitive search
+- fixed_strings: If true, treat pattern as a literal string instead of regex
+- surround_lines: Number of lines of context to show before and after each match
+- max_results: Number of files to return results from (1-{GREP_MAX_RESULTS})
+"""
+    ).render()
+
+
+def glob_description() -> str:
+    return JINJA.from_string(
+        f"""Find files matching a glob pattern in the filesystem.
+
+## Important Notes
+* By default, .gitignore patterns are respected.
+* Hidden files/directories (starting with .) are excluded by default.
+* Results return at most {GLOB_MAX_RESULTS} files sorted by modification time (newest first).
+* This tool matches filenames, not file contents. For content search, use `grep`.
+
+## Input
+- pattern: The glob pattern to match files, for example `*.go`, `**/*.py`, or `cmd/*.ts`
+- path: The absolute path to a directory to search in. Defaults to the current working directory.
+- ignore_gitignore: If true, do not respect .gitignore rules.
+"""
+    ).render()
 
 
 def _find_search_binary(name: str) -> str:

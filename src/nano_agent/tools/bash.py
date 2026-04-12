@@ -5,11 +5,63 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from .base import ToolCallContext, ToolDefinition
-from ._common import BANNED_COMMANDS
-from .descriptions import bash_description
+from ._common import BANNED_COMMANDS, JINJA
 from ._output_impl import truncate_bash_output_for_model
-from .schemas import bash_schema
+
+
+class BashArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = Field(description="The bash command to run")
+    description: str = Field(description="A description of the command to run")
+    timeout: int = Field(description="Timeout in seconds (10-120)")
+
+
+def bash_schema() -> dict[str, Any]:
+    return BashArgs.model_json_schema()
+
+
+def bash_description(tool_names: list[str] | None = None) -> str:
+    available = set(tool_names or [])
+    edit_hint = (
+        "write_file or edit_file"
+        if {"write_file", "edit_file"}.issubset(available)
+        else "apply_patch"
+    )
+    return JINJA.from_string(
+        """Run a bash command in an isolated shell process.
+
+# Restrictions
+Banned commands:
+- vim
+- view
+- less
+- more
+- cd
+
+# Input
+- command: required bash command
+- description: required, 5-10 words
+- timeout: required, 10-120
+
+# Rules
+- Use parallel tool calling for independent commands.
+- Do not run interactive commands.
+- For multiple commands, use ';' or '&&' on one line.
+- Avoid direct cd; use absolute paths or subshell: (cd /path && cmd).
+- {% if prefer_search_tools %}Prefer grep/glob over grep/find in bash.{% else %}For filesystem search activities, use fd and rg via this tool only.{% endif %}
+- Do not use heredoc; use {{ edit_hint }} instead.
+
+Examples:
+- (cd /repo && mise run test)
+"""
+    ).render(
+        prefer_search_tools={"grep", "glob"}.issubset(available),
+        edit_hint=edit_hint,
+    )
 
 
 class BashRunner:

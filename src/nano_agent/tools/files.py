@@ -3,15 +3,114 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ._common import MAX_READ_LINE_CHARACTERS, MAX_READ_LINE_LIMIT, MAX_READ_OUTPUT_BYTES
+from pydantic import BaseModel, ConfigDict, Field
+
+from ._common import JINJA, MAX_READ_LINE_CHARACTERS, MAX_READ_LINE_LIMIT, MAX_READ_OUTPUT_BYTES
 from .base import ToolCallContext, ToolDefinition
-from .descriptions import (
-    edit_file_description,
-    read_file_description,
-    write_file_description,
-)
-from .schemas import edit_file_schema, read_file_schema, write_file_schema
 from .web_fetch import with_numbered_lines
+
+
+class ReadFileArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str = Field(description="The absolute path of the file to read")
+    offset: int | None = Field(
+        default=None,
+        description="The 1-indexed line number to start reading from. Default: 1",
+    )
+    line_limit: int | None = Field(
+        default=None,
+        description=f"The maximum number of lines to read from the offset. Default: {MAX_READ_LINE_LIMIT}. Max: {MAX_READ_LINE_LIMIT}",
+    )
+
+
+class WriteFileArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str = Field(description="The absolute path of the file to write")
+    text: str = Field(description="The text to write to the file")
+
+
+class EditFileArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str = Field(description="The absolute path of the file to edit")
+    old_text: str = Field(description="The text to be replaced")
+    new_text: str = Field(description="The text to replace the old text with")
+    replace_all: bool | None = Field(
+        default=None,
+        description="If true, replace all occurrences of old_text; otherwise old_text must be unique",
+    )
+
+
+def read_file_schema() -> dict[str, Any]:
+    return ReadFileArgs.model_json_schema()
+
+
+def write_file_schema() -> dict[str, Any]:
+    return WriteFileArgs.model_json_schema()
+
+
+def edit_file_schema() -> dict[str, Any]:
+    return EditFileArgs.model_json_schema()
+
+
+def read_file_description() -> str:
+    return JINJA.from_string(
+        f"""Reads a file and returns its contents with line numbers.
+
+This tool takes three parameters:
+- file_path: The absolute path of the file to read
+- offset: The 1-indexed line number to start reading from (default: 1, minimum: 1)
+- line_limit: The maximum number of lines to read from the offset (default: {MAX_READ_LINE_LIMIT}, minimum: 1, maximum: {MAX_READ_LINE_LIMIT})
+
+For most files, omit offset and line_limit to read the entire file. Use these parameters only for large files when you need specific sections.
+
+The result includes line numbers. If there are more lines beyond the line limit, a continuation hint is shown. Very long lines are truncated and total output is capped at {MAX_READ_OUTPUT_BYTES} bytes.
+
+If you need to read multiple files, use parallel tool calling to read multiple files simultaneously.
+"""
+    ).render()
+
+
+def write_file_description() -> str:
+    return JINJA.from_string(
+        """Writes a file with the given text. If the file already exists, its contents will be overwritten.
+
+This tool takes two parameters:
+- file_path: The absolute path of the file to write
+- text: The text to be written to the file. It must not be empty.
+
+IMPORTANT: If you want to create an empty file, use the `bash` tool to run `touch` instead.
+IMPORTANT: If you are overwriting an existing file, read it using `read_file` first. If the file changed after the last read, this tool will ask you to read it again.
+IMPORTANT: Make sure the directory already exists before writing to it.
+"""
+    ).render()
+
+
+def edit_file_description() -> str:
+    return JINJA.from_string(
+        """Edit a file by replacing old text with new text.
+
+If you are creating a new file, use `write_file` instead.
+
+This tool takes four parameters:
+- file_path: The absolute path of the file to edit
+- old_text: The text to be replaced. It must exactly match the text in the file including whitespace.
+- new_text: The replacement text
+- replace_all: Optional, default false. If true, replace all occurrences of old_text; otherwise old_text must be unique.
+
+# RULES
+## Read before editing
+You must read the file using `read_file` before making non-replace_all edits.
+
+## Unique matching
+When replace_all is false, make old_text unique by including 3-5 lines before and after the target block where needed.
+
+## Validate after edit
+If the edit changes code or configuration, validate it with the relevant checks via `bash`.
+"""
+    ).render()
 
 
 def _ensure_absolute_path(cwd: Path, raw_path: str, *, field_name: str) -> Path:

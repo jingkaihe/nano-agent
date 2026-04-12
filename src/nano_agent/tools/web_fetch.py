@@ -6,11 +6,73 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from markdownify import markdownify as html_to_markdown
+from pydantic import BaseModel, ConfigDict, Field
 
-from ._common import ARCHIVE_DIR
+from ._common import ARCHIVE_DIR, JINJA
 from .base import ToolCallContext, ToolDefinition
-from .descriptions import web_fetch_description
-from .schemas import web_fetch_schema
+
+
+class WebFetchArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(description="The URL to fetch content from")
+    prompt: str | None = Field(
+        default=None,
+        description="Information to extract from HTML/Markdown content (optional)",
+    )
+
+
+def web_fetch_schema() -> dict[str, Any]:
+    return WebFetchArgs.model_json_schema()
+
+
+def web_fetch_description() -> str:
+    return JINJA.from_string(
+        """Fetch content from a public URL.
+
+# Input
+- url: required URL to fetch
+- prompt: optional instruction for extracting info from HTML/Markdown pages
+
+# Rules
+- Use HTTPS for external domains.
+- HTTP is allowed only for localhost/internal addresses.
+- Redirects are followed only within the same domain (max 10).
+- Binary content types (zip/pdf/image/audio/video/octet-stream) are rejected.
+
+# Behavior
+- Code/text/JSON/XML/etc:
+  - Save to ~/.nano-agent/web-archives/{domain}/{filename}.{ext}
+  - Return content with line numbers (truncated if output is too large)
+- HTML/Markdown without prompt:
+  - Return full page content as Markdown (HTML is converted)
+- HTML/Markdown with prompt:
+  - Run AI extraction against page content and return only the extracted result
+
+# Prompt guidance
+Use prompt when:
+- You need specific facts/sections from an HTML/Markdown page
+- The page is large and you do not want full-page output
+
+Examples:
+- url: https://docs.example.com/api-reference
+  prompt: List all endpoints with HTTP methods
+- url: https://company.example.com/changelog
+  prompt: Summarize breaking changes in the latest release
+
+Do not use prompt when:
+- You want raw file contents with line numbers
+- You want full-page output
+
+Examples:
+- url: https://raw.githubusercontent.com/user/repo/main/config.yaml
+- url: https://example.com/data.json
+
+# Notes
+- Only public URLs are supported (no auth/session handling).
+- Prompt is ignored for non-HTML/Markdown responses (code/text/JSON/XML).
+"""
+    ).render()
 
 
 def is_local_host(hostname: str) -> bool:
