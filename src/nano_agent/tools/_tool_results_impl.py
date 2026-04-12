@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ._common import *
-from .results import chat_tool_message_content, tool_result_content_parts
+from .results import chat_tool_message_content, tool_result_content, tool_result_content_parts
 
 
 def _tool_error_from_json(exc: json.JSONDecodeError) -> dict[str, Any]:

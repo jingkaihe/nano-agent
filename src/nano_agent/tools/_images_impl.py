@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ._common import *
+from ..platforms.catalog import _model_catalog_entry
 
 
 def supports_view_image_original_detail(model: str) -> bool:

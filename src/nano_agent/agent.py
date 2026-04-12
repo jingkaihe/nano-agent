@@ -28,6 +28,7 @@ from .tools.registry import tool_definition, tool_spec
 from .tools.results import responses_function_call_output
 from .tools._selection_impl import normalize_allowed_tools, select_tool_names
 from .tools._stream_impl import (
+    _coerce_usage_int,
     _extract_text_fragments,
     _extract_usage_metrics,
     _get_delta_fragments,

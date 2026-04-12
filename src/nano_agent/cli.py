@@ -6,10 +6,13 @@ from typing import Any, cast
 
 import click
 import httpx
+from rich.console import Console
+from rich.table import Table
 
 from .agent import run_chat
 from .core import *
 from .platforms import *
+from .tools._selection_impl import normalize_allowed_tools
 
 
 @click.group(

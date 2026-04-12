@@ -35,6 +35,14 @@ def _normalize_anthropic_model(model: dict[str, Any]) -> dict[str, Any]:
     capabilities = model.get("capabilities")
     if not isinstance(capabilities, dict):
         capabilities = {}
+    existing_limits = capabilities.get("limits")
+    limits_payload: dict[str, Any] = (
+        dict(existing_limits) if isinstance(existing_limits, dict) else {}
+    )
+    existing_supports = capabilities.get("supports")
+    supports_payload: dict[str, Any] = (
+        dict(existing_supports) if isinstance(existing_supports, dict) else {}
+    )
 
     limits = {
         "max_context_window_tokens": model.get("max_input_tokens"),
@@ -56,19 +64,11 @@ def _normalize_anthropic_model(model: dict[str, Any]) -> dict[str, Any]:
             "family": model.get("id"),
             "type": model.get("type") or capabilities.get("type") or "model",
             "limits": {
-                **(
-                    capabilities.get("limits")
-                    if isinstance(capabilities.get("limits"), dict)
-                    else {}
-                ),
+                **limits_payload,
                 **{k: v for k, v in limits.items() if isinstance(v, (int, float))},
             },
             "supports": {
-                **(
-                    capabilities.get("supports")
-                    if isinstance(capabilities.get("supports"), dict)
-                    else {}
-                ),
+                **supports_payload,
                 **supports,
             },
             "input_modalities": ["text", "image"],

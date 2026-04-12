@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 from .apply_patch import apply_patch_tool
 from .base import ToolDefinition, function_tool_spec
 from .bash import bash_tool
@@ -8,6 +10,9 @@ from .search import glob_tool, grep_tool
 from .skill import skill_tool
 from .view_image import view_image_tool
 from .web_fetch import web_fetch_tool
+
+if TYPE_CHECKING:
+    from nano_agent.agent import NanoAgent
 
 
 TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
@@ -35,5 +40,5 @@ def tool_definition(name: str) -> ToolDefinition:
         raise ValueError(f"unknown tool: {name}") from exc
 
 
-def tool_spec(name: str, agent: object) -> dict[str, object]:
+def tool_spec(name: str, agent: "NanoAgent") -> dict[str, Any]:
     return function_tool_spec(tool_definition(name), agent)

@@ -5,8 +5,6 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
-
 import nano_agent.core as core
 
 from .helpers import assert_equal, assert_true
@@ -37,7 +35,7 @@ def test_latest_conversation_session_id() -> None:
                     "latest_conversation_session_id should fail when history is empty"
                 )
 
-            history_dir = cast(Path, core.HISTORY_DIR)
+            history_dir = core.HISTORY_DIR
             history_dir.mkdir(parents=True, exist_ok=True)
             (history_dir / "older.json").write_text(
                 json.dumps(

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
+from typing import cast
 
 from nano_agent.core import SkillInfo
+from nano_agent.agent import NanoAgent
 from nano_agent.tools.base import ToolCallContext
 from nano_agent.tools.skill import skill_tool
 
@@ -32,7 +34,7 @@ def test_skill_tool_executes_and_tracks_active_skill() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             agent = _FakeAgent(Path(tmp))
             context = ToolCallContext(
-                agent=agent,
+                agent=cast(NanoAgent, agent),
                 cwd=Path(tmp),
                 model="gpt-5",
                 provider="openai",
@@ -56,7 +58,7 @@ def test_skill_tool_rejects_unknown_skill() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             agent = _FakeAgent(Path(tmp))
             context = ToolCallContext(
-                agent=agent,
+                agent=cast(NanoAgent, agent),
                 cwd=Path(tmp),
                 model="gpt-5",
                 provider="openai",
