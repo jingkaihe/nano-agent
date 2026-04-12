@@ -473,7 +473,7 @@ def _default_system_instructions(
     provider: str = DEFAULT_PROVIDER,
     allowed_tools: list[str] | None = None,
 ) -> str:
-    from .tools import tool_guidance_text
+    from .tools._selection_impl import tool_guidance_text
 
     return (
         """You are an interactive CLI tool that helps with software engineering and production operations tasks. Please follows the instructions and tools below to help the user.
@@ -503,7 +503,7 @@ def _gpt_41_system_instructions(
     provider: str = DEFAULT_PROVIDER,
     allowed_tools: list[str] | None = None,
 ) -> str:
-    from .tools import tool_guidance_text
+    from .tools._selection_impl import tool_guidance_text
 
     return (
         """You are an agent - please keep going until the user’s query is completely resolved, before ending your turn and yielding back to the user.

@@ -15,29 +15,33 @@ from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolPara
 
 from .core import *
 from .core import (
-    _extract_text_fragments,
-    _extract_usage_metrics,
-    _get_delta_fragments,
     _is_copilot_claude_chat,
     _is_copilot_provider,
-    _merge_stream_tool_call,
     extract_function_calls_from_response,
 )
 from .platforms import *
 from .platforms import _close_async_client, _is_async_context_manager
-from .tools import *
-from .tools import (
-    _file_mtime,
+from .tools.base import ToolCallContext
+from .tools.bash import BashRunner
+from .tools.files import _file_mtime
+from .tools.registry import tool_definition, tool_spec
+from .tools.results import responses_function_call_output
+from .tools._selection_impl import normalize_allowed_tools, select_tool_names
+from .tools._stream_impl import (
+    _extract_text_fragments,
+    _extract_usage_metrics,
+    _get_delta_fragments,
+    _merge_stream_tool_call,
     _ordered_tool_calls,
-    _tool_error_from_json,
-    _tool_result_message_content,
     _to_plain_data,
     anthropic_thinking_config,
+    build_anthropic_messages,
+)
+from .tools._tool_results_impl import (
+    _tool_error_from_json,
+    _tool_result_message_content,
     chat_followup_image_message,
-    responses_function_call_output,
-    tool_definition,
-    tool_spec,
-    ToolCallContext,
+    parse_tool_call_arguments,
 )
 from .ui import ChatUI
 
