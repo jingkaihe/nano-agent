@@ -1,22 +1,38 @@
 # nano-agent
 
-`nano-agent` is a tiny single-file coding agent CLI.
+`nano-agent` is a small packaged coding agent CLI.
 
 ## Install
 
-By default the installer drops `nano-agent` into `~/.local/bin`:
+Install directly from Git with `uv tool`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jingkaihe/nano-agent/main/install.sh | bash
+uv tool install "git+https://github.com/jingkaihe/nano-agent"
 ```
 
 Install a different branch:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jingkaihe/nano-agent/main/install.sh | bash -s -- --branch my-branch
+uv tool install --force "git+https://github.com/jingkaihe/nano-agent@my-branch"
 ```
 
-`nano-agent` runs via [`uv`](https://docs.astral.sh/uv/), and the installer uses `git`, so make sure both are installed and that `~/.local/bin` is on your `PATH`.
+For local development from a checkout:
+
+```bash
+uv run --project . nano-agent --help
+uv run pytest tests
+```
+
+`nano-agent` is packaged with [`uv`](https://docs.astral.sh/uv/), so `uv tool install` works against the Git repository directly.
+
+## Platforms And APIs
+
+`nano-agent` now separates platform choice from API shape:
+
+- Platforms: `copilot`, `openai`, `anthropic`
+- API modes: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages
+
+The runtime selects the appropriate API mode from the chosen platform and model.
 
 ## Enterprise usage
 

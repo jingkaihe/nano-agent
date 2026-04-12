@@ -1,0 +1,36 @@
+[project]
+name = "nano-agent"
+version = "0.1.0"
+description = "Minimal coding agent CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic>=0.82.0",
+  "click>=8.1.8",
+  "httpx>=0.28.1",
+  "Jinja2>=3.1.4",
+  "markdownify>=0.13.1",
+  "openai>=1.68.2",
+  "Pillow>=10.4.0",
+  "prompt_toolkit>=3.0.47",
+  "PyYAML>=6.0.2",
+  "rich>=13.9.4",
+]
+
+[project.scripts]
+nano-agent = "nano_agent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"

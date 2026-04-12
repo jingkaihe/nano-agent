@@ -4,27 +4,24 @@ set -euo pipefail
 
 REPO="jingkaihe/nano-agent"
 DEFAULT_BRANCH="main"
-DEST_DIR="${HOME}/.local/bin"
 BRANCH="${DEFAULT_BRANCH}"
-SCRIPT_NAME="nano-agent"
+PACKAGE_NAME="nano-agent"
 
 usage() {
     cat <<EOF
-Install ${SCRIPT_NAME} into ~/.local/bin by default.
+Install ${PACKAGE_NAME} with uv tool install.
 
 Usage:
-  ./install.sh [--branch <name>] [--dest-dir <dir>] [--repo <owner/repo>]
+  ./install.sh [--branch <name>] [--repo <owner/repo>]
 
 Options:
   --branch <name>    Git branch to install from (default: ${DEFAULT_BRANCH})
-  --dest-dir <dir>   Installation directory (default: ${DEST_DIR})
   --repo <repo>      GitHub repository to install from (default: ${REPO})
   -h, --help         Show this help text
 
 Examples:
   ./install.sh
   ./install.sh --branch feat/sandbox
-  ./install.sh --dest-dir /usr/local/bin
 EOF
 }
 
@@ -68,36 +65,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-have_cmd git || die "git is required"
-have_cmd install || die "install is required"
+have_cmd uv || die "uv is required"
 
-TMP_DIR="$(mktemp -d)"
-CLONE_DIR="${TMP_DIR}/repo"
-cleanup() {
-    rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT
+REPO_URL="git+https://github.com/${REPO}"
+PACKAGE_SPEC="${REPO_URL}@${BRANCH}"
 
-REPO_URL="https://github.com/${REPO}.git"
+log "installing ${PACKAGE_NAME} from ${REPO}@${BRANCH}"
+uv tool install --force "$PACKAGE_SPEC"
 
-log "cloning ${REPO}@${BRANCH}"
-git clone --depth=1 --branch "$BRANCH" --single-branch "$REPO_URL" "$CLONE_DIR" >/dev/null 2>&1
+BIN_DIR="$(uv tool dir --bin)"
+log "installed to ${BIN_DIR}/${PACKAGE_NAME}"
 
-SOURCE_PATH="${CLONE_DIR}/${SCRIPT_NAME}"
-[[ -f "$SOURCE_PATH" ]] || die "could not find ${SCRIPT_NAME} in cloned repository"
-
-mkdir -p "$DEST_DIR"
-install -m 0755 "$SOURCE_PATH" "$DEST_DIR/$SCRIPT_NAME"
-
-log "installed to $DEST_DIR/$SCRIPT_NAME"
-
-if ! have_cmd uv; then
-    log "warning: uv is not installed; ${SCRIPT_NAME} needs uv on PATH to run"
-    log "install uv from https://docs.astral.sh/uv/ and then run ${SCRIPT_NAME} --help"
-fi
-
-if [[ ":$PATH:" != *":${DEST_DIR}:"* ]]; then
-    log "warning: ${DEST_DIR} is not currently on PATH"
+if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
+    log "warning: ${BIN_DIR} is not currently on PATH"
 fi
 
 log "done"
