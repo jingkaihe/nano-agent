@@ -403,7 +403,12 @@ def refresh_copilot_token(
         headers=copilot_token_exchange_headers(creds["access_token"]),
         timeout=30,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise CopilotAuthError(
+            "Failed to refresh Copilot token. Run `nano-agent login` to re-authenticate."
+        ) from exc
     token_data = response.json()
     creds["copilot_token"] = token_data["token"]
     creds["copilot_expires_at"] = token_data["expires_at"]

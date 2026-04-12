@@ -36,6 +36,11 @@ def test_is_copilot_auth_error() -> None:
         response=httpx.Response(400, request=httpx.Request("GET", "https://example.com")),
         body=None,
     )
+    bad_auth_header_exc = openai.BadRequestError(
+        "bad request: Authorization header is badly formatted",
+        response=httpx.Response(400, request=httpx.Request("GET", "https://example.com")),
+        body=None,
+    )
 
     assert_true(platforms.is_copilot_auth_error(auth_exc), "401 auth errors should be retried")
     assert_true(
@@ -45,6 +50,10 @@ def test_is_copilot_auth_error() -> None:
     assert_true(
         not platforms.is_copilot_auth_error(bad_request_exc),
         "non-auth API errors should not be treated as refreshable",
+    )
+    assert_true(
+        platforms.is_copilot_auth_error(bad_auth_header_exc),
+        "badly formatted auth headers should trigger Copilot re-auth",
     )
 
 
@@ -93,3 +102,28 @@ def test_refresh_copilot_token_renews_expiring_token(monkeypatch: Any) -> None:
     assert_equal(refreshed["copilot_expires_at"], "2099-01-01T00:00:00Z")
     assert_equal(len(saved_creds), 1)
     assert_equal(saved_creds[0]["copilot_token"], "fresh-copilot-token")
+
+
+def test_refresh_copilot_token_wraps_http_error(monkeypatch: Any) -> None:
+    def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", url)
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(core.httpx, "get", fake_get)
+
+    creds = {
+        "access_token": "github-token",
+        "copilot_token": "stale-copilot-token",
+        "copilot_expires_at": time.time() + 60,
+    }
+
+    try:
+        core.refresh_copilot_token(creds)
+    except core.CopilotAuthError as exc:
+        assert_true(
+            "re-authenticate" in str(exc),
+            "refresh failures should instruct the user to log in again",
+        )
+        return
+
+    raise AssertionError("refresh_copilot_token should wrap HTTP errors")

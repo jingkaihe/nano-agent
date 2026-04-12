@@ -4,32 +4,39 @@ import inspect
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import anthropic
 import httpx
 import nano_agent.core as core
 import openai
-from anthropic import AsyncAnthropic, Anthropic
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
+from rich.console import Console
+from rich.table import Table
 
 from .core import (
+    COPILOT_CLIENT_ID,
     COPILOT_CHAT_PLUGIN_VERSION,
     COPILOT_CHAT_USER_AGENT,
+    COPILOT_DEVICE_URL,
     COPILOT_EDITOR_VERSION,
     COPILOT_EXCHANGE_URL,
     COPILOT_GITHUB_API_VERSION,
     COPILOT_INTEGRATION_ID,
     COPILOT_OPENAI_USER_AGENT,
+    COPILOT_SCOPES,
     COPILOT_TOKEN_URL,
     COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
-    MODELS_CACHE_TTL_SECONDS,
-    _coerce_expires_at,
-    iso_now,
+    CopilotAuthError,
+    _legacy_context_window_limit,
     load_cached_provider_models,
     load_copilot_credentials,
+    refresh_copilot_token,
     save_cached_provider_models,
     save_copilot_credentials,
+    should_use_anthropic_messages_api,
 )
 
 
@@ -64,6 +71,21 @@ def _copilot_auth_error_status(exc: Exception) -> int | None:
     return response_status if isinstance(response_status, int) else None
 
 
+def _looks_like_copilot_auth_error(exc: Exception) -> bool:
+    status = _copilot_auth_error_status(exc)
+    if status in {401, 403}:
+        return True
+    if status != 400:
+        return False
+
+    message = str(exc).strip().lower()
+    return (
+        "authorization header is badly formatted" in message
+        or "authorization header" in message
+        or "invalid authorization" in message
+    )
+
+
 def is_copilot_auth_error(exc: Exception) -> bool:
     if isinstance(
         exc,
@@ -77,7 +99,7 @@ def is_copilot_auth_error(exc: Exception) -> bool:
         return True
 
     if isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError)):
-        return _copilot_auth_error_status(exc) in {401, 403}
+        return _looks_like_copilot_auth_error(exc)
 
     return False
 

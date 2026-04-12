@@ -16,11 +16,28 @@ from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
 from .core import *
-from .core import _is_copilot_provider
+from .core import (
+    _extract_text_fragments,
+    _extract_usage_metrics,
+    _get_delta_fragments,
+    _is_copilot_claude_chat,
+    _is_copilot_provider,
+    _merge_stream_tool_call,
+    extract_function_calls_from_response,
+)
 from .platforms import *
 from .platforms import _close_async_client, _is_async_context_manager
 from .tools import *
-from .tools import _tool_result_message_content
+from .tools import (
+    _file_mtime,
+    _ordered_tool_calls,
+    _tool_error_from_json,
+    _tool_result_message_content,
+    _to_plain_data,
+    anthropic_thinking_config,
+    chat_followup_image_message,
+    responses_function_call_output,
+)
 from .ui import ChatUI
 
 class _CopilotRefreshAsyncContextManager:
