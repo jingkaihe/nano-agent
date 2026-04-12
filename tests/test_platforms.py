@@ -23,26 +23,36 @@ def test_copilot_headers() -> None:
 def test_is_copilot_auth_error() -> None:
     auth_exc = openai.AuthenticationError(
         "unauthorized",
-        response=httpx.Response(401, request=httpx.Request("GET", "https://example.com")),
+        response=httpx.Response(
+            401, request=httpx.Request("GET", "https://example.com")
+        ),
         body=None,
     )
     forbidden_exc = openai.PermissionDeniedError(
         "forbidden",
-        response=httpx.Response(403, request=httpx.Request("GET", "https://example.com")),
+        response=httpx.Response(
+            403, request=httpx.Request("GET", "https://example.com")
+        ),
         body=None,
     )
     bad_request_exc = openai.APIStatusError(
         "bad request",
-        response=httpx.Response(400, request=httpx.Request("GET", "https://example.com")),
+        response=httpx.Response(
+            400, request=httpx.Request("GET", "https://example.com")
+        ),
         body=None,
     )
     bad_auth_header_exc = openai.BadRequestError(
         "bad request: Authorization header is badly formatted",
-        response=httpx.Response(400, request=httpx.Request("GET", "https://example.com")),
+        response=httpx.Response(
+            400, request=httpx.Request("GET", "https://example.com")
+        ),
         body=None,
     )
 
-    assert_true(platforms.is_copilot_auth_error(auth_exc), "401 auth errors should be retried")
+    assert_true(
+        platforms.is_copilot_auth_error(auth_exc), "401 auth errors should be retried"
+    )
     assert_true(
         platforms.is_copilot_auth_error(forbidden_exc),
         "403 permission errors should be retried",

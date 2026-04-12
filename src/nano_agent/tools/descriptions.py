@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
 
-from ._common import JINJA, MAX_READ_LINE_LIMIT, MAX_READ_OUTPUT_BYTES, GREP_MAX_RESULTS, GLOB_MAX_RESULTS
+from ._common import (
+    JINJA,
+    MAX_READ_LINE_LIMIT,
+    MAX_READ_OUTPUT_BYTES,
+    GREP_MAX_RESULTS,
+    GLOB_MAX_RESULTS,
+)
 from ._images_impl import supports_view_image_original_detail
+
+
 def bash_description(tool_names: list[str] | None = None) -> str:
     available = set(tool_names or [])
     edit_hint = (

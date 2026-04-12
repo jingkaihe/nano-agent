@@ -45,6 +45,7 @@ def create_anthropic_copilot_client() -> AsyncAnthropic:
         default_headers=copilot_anthropic_headers(),
     )
 
+
 __all__ = [
     "copilot_anthropic_headers",
     "copilot_api_headers",

@@ -4,8 +4,6 @@ import inspect
 import os
 import time
 import uuid
-from pathlib import Path
-from typing import Any
 
 import anthropic
 import httpx
@@ -17,9 +15,9 @@ from rich.console import Console
 from rich.table import Table
 
 from ..core import (
-    COPILOT_CLIENT_ID,
     COPILOT_CHAT_PLUGIN_VERSION,
     COPILOT_CHAT_USER_AGENT,
+    COPILOT_CLIENT_ID,
     COPILOT_DEVICE_URL,
     COPILOT_EDITOR_VERSION,
     COPILOT_EXCHANGE_URL,
@@ -38,6 +36,7 @@ from ..core import (
     save_copilot_credentials,
     should_use_anthropic_messages_api,
 )
+
 
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_API_VERSION = "2023-06-01"

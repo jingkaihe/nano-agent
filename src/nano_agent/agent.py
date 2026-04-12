@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import threading
@@ -39,6 +38,7 @@ from .tools import (
     responses_function_call_output,
 )
 from .ui import ChatUI
+
 
 class _CopilotRefreshAsyncContextManager:
     def __init__(self, agent: NanoAgent, call: Callable[[], Any], manager: Any) -> None:

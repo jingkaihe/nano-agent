@@ -28,6 +28,7 @@ def resolve_openai_api_key(api_key: str | None) -> str:
 def resolve_openai_base_url(base_url: str | None) -> str | None:
     return base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
 
+
 __all__ = [
     "create_direct_openai_client",
     "resolve_openai_api_key",

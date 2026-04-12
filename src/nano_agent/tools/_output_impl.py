@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._common import *
 
+
 def truncate_tool_output(
     text: str, max_bytes: int = MAX_TOOL_OUTPUT_BYTES
 ) -> tuple[str, bool]:

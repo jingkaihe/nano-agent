@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._common import *
 
+
 def supports_view_image_original_detail(model: str) -> bool:
     normalized = model.strip().lower()
     return normalized == "gpt-5.3-codex"

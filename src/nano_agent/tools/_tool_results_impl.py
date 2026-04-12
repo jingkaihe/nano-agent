@@ -3,6 +3,7 @@ from __future__ import annotations
 from ._common import *
 from .results import chat_tool_message_content, tool_result_content_parts
 
+
 def _tool_error_from_json(exc: json.JSONDecodeError) -> dict[str, Any]:
     return {"success": False, "error": f"invalid JSON arguments: {exc}"}
 
@@ -14,6 +15,7 @@ def parse_tool_call_arguments(arguments: str | None) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("tool arguments must decode to an object")
     return parsed
+
 
 def _tool_result_message_content(
     result: dict[str, Any], *, role: str, api: str

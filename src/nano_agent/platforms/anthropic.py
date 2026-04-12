@@ -18,9 +18,7 @@ def resolve_anthropic_api_key(api_key: str | None) -> str:
 
 def resolve_anthropic_base_url(base_url: str | None) -> str | None:
     return (
-        base_url
-        or os.getenv("ANTHROPIC_BASE_URL")
-        or os.getenv("NANO_AGENT_BASE_URL")
+        base_url or os.getenv("ANTHROPIC_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
     )
 
 
@@ -76,6 +74,7 @@ def _normalize_anthropic_model(model: dict[str, Any]) -> dict[str, Any]:
             "input_modalities": ["text", "image"],
         },
     }
+
 
 __all__ = [
     "create_direct_anthropic_client",

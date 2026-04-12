@@ -9,6 +9,7 @@ from .results import (
     _copilot_cache_control,
 )
 
+
 def _to_plain_data(value: Any) -> Any:
     if value is None:
         return None

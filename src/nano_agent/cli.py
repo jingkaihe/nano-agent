@@ -11,6 +11,7 @@ from .agent import run_chat
 from .core import *
 from .platforms import *
 
+
 @click.group(
     invoke_without_command=True,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
@@ -418,6 +419,7 @@ def models_command(
         raise click.ClickException(f"Failed to list models: {exc}") from exc
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+
 
 if __name__ == "__main__":
     cast(Any, main)()

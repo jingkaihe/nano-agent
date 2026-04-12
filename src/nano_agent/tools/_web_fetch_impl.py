@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._common import *
 
+
 def is_local_host(hostname: str) -> bool:
     return hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 

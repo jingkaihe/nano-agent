@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._common import *
 
+
 def normalize_allowed_tools(value: Any) -> list[str] | None:
     if value is None:
         return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 from ._common import *
 from ._files_impl import _ensure_absolute_path
 
+
 def _find_search_binary(name: str) -> str:
     binary = shutil.which(name)
     if not binary:

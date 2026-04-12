@@ -371,7 +371,9 @@ def test_execute_tool_calls_only_adds_chat_followup_image_message() -> None:
             }
 
             agent.messages = []
-            await agent.execute_tool_calls([tool_call], call_id_key="id", api="messages")
+            await agent.execute_tool_calls(
+                [tool_call], call_id_key="id", api="messages"
+            )
             assert_equal(len(agent.messages), 1)
             assert_equal(agent.messages[0]["role"], "tool")
             assert_true(

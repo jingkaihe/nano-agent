@@ -45,7 +45,6 @@ class BashRunner:
         return result.returncode, output, truncated
 
 
-
 def validate_bash_args(
     command: Any, description: Any, timeout: Any
 ) -> tuple[str, str, int]:

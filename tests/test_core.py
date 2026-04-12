@@ -70,7 +70,9 @@ def test_latest_conversation_session_id() -> None:
 
 
 def test_default_weak_model() -> None:
-    assert_equal(core.default_weak_model("copilot", "claude-sonnet-4.5"), "claude-haiku-4.5")
+    assert_equal(
+        core.default_weak_model("copilot", "claude-sonnet-4.5"), "claude-haiku-4.5"
+    )
     assert_equal(core.default_weak_model("copilot", "gpt-5"), "gpt-4.1")
     assert_equal(core.default_weak_model("openai", "gpt-5"), "gpt-4.1")
 
@@ -174,9 +176,7 @@ def test_apply_copilot_ephemeral_cache() -> None:
             model="claude-messages-only",
             endpoint="/chat/completions",
         )
-        assert_true(
-            unchanged is messages, "messages-only models should not be patched"
-        )
+        assert_true(unchanged is messages, "messages-only models should not be patched")
 
         unspecified = core.apply_copilot_ephemeral_cache(
             messages,

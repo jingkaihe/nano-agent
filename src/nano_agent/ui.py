@@ -13,6 +13,7 @@ from rich.table import Table
 from .core import BASH_MAX_OUTPUT_TOKENS, SessionUsage
 from .platforms import model_context_window_limit
 
+
 class ChatUI:
     def __init__(self) -> None:
         self.console = Console()
@@ -361,6 +362,7 @@ class ChatUI:
 
         self.console.print(table)
 
+
 def _format_int(value: int) -> str:
     return f"{value:,}"
 
@@ -374,4 +376,3 @@ def _format_ratio(value: int, total: int | None) -> str:
         return _format_int(value)
     percentage = value / total * 100
     return f"{_format_int(value)} / {_format_int(total)} ({percentage:.1f}%)"
-

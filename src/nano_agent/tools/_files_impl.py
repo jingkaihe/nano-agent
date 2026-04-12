@@ -3,6 +3,7 @@ from __future__ import annotations
 from ._common import *
 from ._web_fetch_impl import with_numbered_lines
 
+
 def _ensure_absolute_path(cwd: Path, raw_path: str, *, field_name: str) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ValueError(f"{field_name} is required")

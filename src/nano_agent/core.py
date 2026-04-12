@@ -14,8 +14,6 @@ from typing import Any, cast
 import httpx
 import yaml
 from jinja2 import Environment, StrictUndefined
-from rich.console import Console
-from rich.table import Table
 
 import nano_agent.core as core_module
 
@@ -95,6 +93,7 @@ DEFAULT_CHAT_TOOL_NAMES = [
 class CopilotAuthError(Exception):
     pass
 
+
 def credentials_path() -> Path:
     raw = os.getenv("NANO_AGENT_COPILOT_CREDS")
     if raw:
@@ -147,6 +146,8 @@ def summarize_prompt(text: str, max_words: int = 10) -> str:
 
 
 def load_conversation_history(session_id: str) -> dict[str, Any]:
+    from .tools._selection_impl import normalize_allowed_tools
+
     normalized = normalize_session_id(session_id)
     path = conversation_history_path(normalized)
     if not path.exists():
@@ -414,6 +415,7 @@ def refresh_copilot_token(
     creds["copilot_expires_at"] = token_data["expires_at"]
     save_copilot_credentials(creds)
     return creds["copilot_token"], creds
+
 
 def is_git_repo(cwd: Path) -> bool:
     try:
@@ -880,7 +882,6 @@ Skills are currently not available.
     return template.render(skills=[skills[name] for name in sorted(skills)]).rstrip()
 
 
-
 def _to_plain_data(value: Any) -> Any:
     if value is None:
         return None
@@ -976,6 +977,8 @@ def _legacy_context_window_limit(model: str) -> int | None:
 
 
 def _context_window_limit(model: str, provider: str = "copilot") -> int | None:
+    from .platforms.catalog import model_context_window_limit
+
     return model_context_window_limit(model, provider=provider)
 
 

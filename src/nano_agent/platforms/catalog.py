@@ -268,6 +268,7 @@ def render_models_table(models: list[dict[str, Any]], provider: str) -> None:
 
     console.print(table)
 
+
 __all__ = [
     "_model_catalog_entry",
     "list_provider_models",

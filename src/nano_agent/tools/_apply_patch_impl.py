@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._common import *
 
+
 @dataclass
 class Hunk:
     header: str

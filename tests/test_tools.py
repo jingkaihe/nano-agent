@@ -143,7 +143,9 @@ def test_build_anthropic_messages() -> None:
     assert_equal(system, "sys")
     assert_equal(messages[0], {"role": "user", "content": "hello"})
     assistant_blocks = messages[1]["content"]
-    assert_true(isinstance(assistant_blocks, list), "assistant content should be block list")
+    assert_true(
+        isinstance(assistant_blocks, list), "assistant content should be block list"
+    )
     assert_equal(assistant_blocks[1]["type"], "tool_use")
     assert_equal(messages[2]["content"][0]["type"], "tool_result")
 
@@ -182,7 +184,9 @@ def test_build_anthropic_messages() -> None:
         "ephemeral",
     )
     assert_equal(cached_messages[0]["content"][0]["cache_control"]["type"], "ephemeral")
-    assert_equal(cached_messages[1]["content"][-1]["cache_control"]["type"], "ephemeral")
+    assert_equal(
+        cached_messages[1]["content"][-1]["cache_control"]["type"], "ephemeral"
+    )
     assert_equal(cached_messages[2]["content"][0]["cache_control"]["type"], "ephemeral")
 
     image_data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
@@ -222,7 +226,9 @@ def test_view_image_schema_and_helpers() -> None:
         "detail": "original",
     }
     response_output = tools.responses_function_call_output(image_result)
-    assert_true(isinstance(response_output, list), "responses output should allow image parts")
+    assert_true(
+        isinstance(response_output, list), "responses output should allow image parts"
+    )
     response_parts = cast(list[dict[str, Any]], response_output)
     assert_equal(response_parts[0]["type"], "input_image")
     assert_equal(response_parts[0]["detail"], "original")
@@ -235,7 +241,10 @@ def test_view_image_schema_and_helpers() -> None:
     )
 
     followup = chat_followup_image_message(image_result)
-    assert_true(followup is not None, "chat completions should synthesize a follow-up image message")
+    assert_true(
+        followup is not None,
+        "chat completions should synthesize a follow-up image message",
+    )
     followup_message = cast(dict[str, Any], followup)
     content = cast(list[dict[str, Any]], followup_message["content"])
     assert_equal(content[0]["type"], "image_url")
@@ -258,8 +267,14 @@ def test_view_image_roundtrip() -> None:
             provider="openai",
         )
         assert_equal(resized["mime_type"], "image/png")
-        assert_true(resized["width"] <= core.VIEW_IMAGE_MAX_WIDTH, "resized width should be bounded")
-        assert_true(resized["height"] <= core.VIEW_IMAGE_MAX_HEIGHT, "resized height should be bounded")
+        assert_true(
+            resized["width"] <= core.VIEW_IMAGE_MAX_WIDTH,
+            "resized width should be bounded",
+        )
+        assert_true(
+            resized["height"] <= core.VIEW_IMAGE_MAX_HEIGHT,
+            "resized height should be bounded",
+        )
         assert_true(resized["width"] < 2304, "resized image should shrink width")
         assert_equal(resized.get("detail"), None)
 
@@ -327,7 +342,9 @@ def test_truncate_tool_output() -> None:
 
 
 def test_truncate_bash_output_for_model() -> None:
-    passthrough, passthrough_truncated = tools.truncate_bash_output_for_model("hello world\n")
+    passthrough, passthrough_truncated = tools.truncate_bash_output_for_model(
+        "hello world\n"
+    )
     assert_equal(passthrough, "hello world\n")
     assert_true(not passthrough_truncated, "short bash output should not be truncated")
 
@@ -378,7 +395,9 @@ def test_file_tool_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
         path = cwd / "demo.txt"
-        created = tools.execute_write_file(str(path), "alpha\nbeta\n", cwd, last_read_time=None)
+        created = tools.execute_write_file(
+            str(path), "alpha\nbeta\n", cwd, last_read_time=None
+        )
         assert_true(created["success"], "write_file should create a file")
 
         read = tools.execute_read_file(str(path), cwd)
