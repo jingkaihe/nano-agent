@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Callable, cast
 
 from anthropic import AsyncAnthropic
-from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
@@ -36,6 +35,9 @@ from .tools import (
     anthropic_thinking_config,
     chat_followup_image_message,
     responses_function_call_output,
+    tool_definition,
+    tool_spec,
+    ToolCallContext,
 )
 from .ui import ChatUI
 
@@ -446,35 +448,7 @@ class NanoAgent:
         return discover_skills(self.cwd)
 
     def tool_specs(self) -> list[dict[str, Any]]:
-        tool_map: dict[str, tuple[str, dict[str, Any]]] = {
-            "bash": (bash_description(self.active_tool_names()), bash_schema()),
-            "apply_patch": (apply_patch_description(), apply_patch_schema()),
-            "read_file": (read_file_description(), read_file_schema()),
-            "write_file": (write_file_description(), write_file_schema()),
-            "edit_file": (edit_file_description(), edit_file_schema()),
-            "grep": (grep_description(), grep_schema()),
-            "glob": (glob_description(), glob_schema()),
-            "skill": (skill_description(self.current_skills()), skill_schema()),
-            "web_fetch": (web_fetch_description(), web_fetch_schema()),
-            "view_image": (
-                view_image_description(self.model),
-                view_image_schema(self.model),
-            ),
-        }
-        specs: list[dict[str, Any]] = []
-        for name in self.active_tool_names():
-            description, parameters = tool_map[name]
-            specs.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": parameters,
-                    },
-                }
-            )
-        return specs
+        return [tool_spec(name, self) for name in self.active_tool_names()]
 
     async def extract_from_markdown(self, prompt: str, markdown: str) -> str:
         limited = markdown[:50000]
@@ -854,182 +828,15 @@ class NanoAgent:
                 if self.debug_tools:
                     self.ui.show_debug(f"tool call rejected: {name}")
                 raise ValueError(f"tool {name!r} is not enabled for this run")
-
-            if name == "bash":
-                command, _description, timeout = validate_bash_args(
-                    arguments.get("command"),
-                    arguments.get("description"),
-                    arguments.get("timeout"),
-                )
-                exit_code, output, truncated = self.bash.run(command, timeout)
-                return {
-                    "success": exit_code == 0,
-                    "command": command,
-                    "exit_code": exit_code,
-                    "output": output,
-                    "truncated": truncated,
-                }
-
-            if name == "apply_patch":
-                patch_input = arguments.get("input")
-                if not isinstance(patch_input, str) or not patch_input.strip():
-                    raise ValueError("input is required")
-                return execute_apply_patch(patch_input, self.cwd)
-
-            if name == "read_file":
-                result = execute_read_file(
-                    cast(str, arguments.get("file_path") or ""),
-                    self.cwd,
-                    offset=cast(int, arguments.get("offset") or 1),
-                    line_limit=cast(
-                        int,
-                        arguments.get("line_limit") or MAX_READ_LINE_LIMIT,
-                    ),
-                )
-                self.mark_file_read(Path(cast(str, result["file_path"])))
-                return result
-
-            if name == "write_file":
-                path = _ensure_absolute_path(
-                    self.cwd,
-                    cast(str, arguments.get("file_path") or ""),
-                    field_name="file_path",
-                )
-                with self._get_file_lock(path):
-                    result = execute_write_file(
-                        str(path),
-                        cast(str, arguments.get("text") or ""),
-                        self.cwd,
-                        last_read_time=self.last_read_time(path),
-                    )
-                self.mark_file_read(path)
-                return result
-
-            if name == "edit_file":
-                path = _ensure_absolute_path(
-                    self.cwd,
-                    cast(str, arguments.get("file_path") or ""),
-                    field_name="file_path",
-                )
-                with self._get_file_lock(path):
-                    result = execute_edit_file(
-                        str(path),
-                        cast(str, arguments.get("old_text") or ""),
-                        cast(str, arguments.get("new_text") or ""),
-                        self.cwd,
-                        replace_all=bool(arguments.get("replace_all", False)),
-                        last_read_time=self.last_read_time(path),
-                    )
-                self.mark_file_read(path)
-                return result
-
-            if name == "grep":
-                return execute_grep(
-                    cast(str, arguments.get("pattern") or ""),
-                    self.cwd,
-                    path=cast(str | None, arguments.get("path")),
-                    include=cast(str | None, arguments.get("include")),
-                    ignore_case=bool(arguments.get("ignore_case", False)),
-                    fixed_strings=bool(arguments.get("fixed_strings", False)),
-                    surround_lines=cast(int, arguments.get("surround_lines") or 0),
-                    max_results=cast(
-                        int,
-                        arguments.get("max_results") or GREP_MAX_RESULTS,
-                    ),
-                )
-
-            if name == "glob":
-                return execute_glob(
-                    cast(str, arguments.get("pattern") or ""),
-                    self.cwd,
-                    path=cast(str | None, arguments.get("path")),
-                    ignore_gitignore=bool(arguments.get("ignore_gitignore", False)),
-                )
-
-            if name == "skill":
-                skill_name = arguments.get("skill_name")
-                if not isinstance(skill_name, str) or not skill_name.strip():
-                    raise ValueError("skill_name is required")
-                skills = self.current_skills()
-                if skill_name not in skills:
-                    available = ", ".join(sorted(skills)) or "none"
-                    raise ValueError(
-                        f"unknown skill '{skill_name}'. Available skills: {available}"
-                    )
-                if skill_name in self.active_skills:
-                    raise ValueError(f"skill '{skill_name}' is already active")
-                self.active_skills.add(skill_name)
-                skill = skills[skill_name]
-                content = f"""# Skill: {skill.name}
-
-The skill directory is located at: {skill.directory}
-
-{skill.content}"""
-                return {
-                    "success": True,
-                    "skill_name": skill.name,
-                    "directory": str(skill.directory),
-                    "content": content,
-                }
-
-            if name == "web_fetch":
-                raw_url = arguments.get("url")
-                prompt = arguments.get("prompt", "")
-                if not isinstance(raw_url, str) or not raw_url.strip():
-                    raise ValueError("url is required")
-                if prompt is None:
-                    prompt = ""
-                if not isinstance(prompt, str):
-                    raise ValueError("prompt must be a string")
-
-                content, content_type = await fetch_with_same_domain_redirects(raw_url)
-                if not is_markdown_like(raw_url, content_type):
-                    archive_path = archive_filename(raw_url, content_type)
-                    archive_path.parent.mkdir(parents=True, exist_ok=True)
-                    archive_path.write_text(content)
-                    return {
-                        "success": True,
-                        "url": raw_url,
-                        "file_path": str(archive_path),
-                        "content": add_line_numbers(content),
-                    }
-
-                markdown = (
-                    html_to_markdown(content, heading_style="ATX")
-                    if "text/html" in content_type
-                    else content
-                )
-                if prompt.strip():
-                    extracted = await self.extract_from_markdown(prompt, markdown)
-                    return {
-                        "success": True,
-                        "url": raw_url,
-                        "prompt": prompt,
-                        "content": extracted,
-                    }
-                return {"success": True, "url": raw_url, "content": markdown}
-
-            if name == "view_image":
-                raw_path = arguments.get("path")
-                detail = arguments.get("detail")
-                if not isinstance(raw_path, str) or not raw_path.strip():
-                    raise ValueError("path is required")
-                if detail is not None and not isinstance(detail, str):
-                    raise ValueError("detail must be a string when provided")
-                candidate = Path(raw_path.strip())
-                resolved = (
-                    candidate.resolve()
-                    if candidate.is_absolute()
-                    else (self.cwd / candidate).resolve()
-                )
-                return make_view_image_result(
-                    resolved,
-                    detail=detail,
-                    model=self.model,
-                    provider=self.provider,
-                )
-
-            raise ValueError(f"unknown tool: {name}")
+            tool = tool_definition(name)
+            context = ToolCallContext(
+                agent=self,
+                cwd=self.cwd,
+                model=self.model,
+                provider=self.provider,
+                arguments=arguments,
+            )
+            return await tool.execute(context)
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
