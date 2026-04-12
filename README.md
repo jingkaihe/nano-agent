@@ -34,6 +34,13 @@ uv run pytest tests
 
 The runtime selects the appropriate API mode from the chosen platform and model.
 
+The codebase also now uses dedicated package directories for larger surfaces:
+
+- `src/nano_agent/platforms/`: platform-specific runtime and login code
+- `src/nano_agent/tools/`: tool-specific implementations and schemas
+
+Tool schemas can be generated with Pydantic-backed models where that keeps the definitions simpler, while preserving the existing runtime behavior and tool surface.
+
 ## Enterprise usage
 
 If you are running `nano-agent` in an enterprise environment, export the required `uv` and company-specific environment variables before installing or running the CLI.

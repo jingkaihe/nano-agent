@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from PIL import Image
 
-from .core import (
+from ..core import (
     ALL_TOOL_NAMES,
     ARCHIVE_DIR,
     BANNED_COMMANDS,
@@ -39,7 +39,7 @@ from .core import (
     should_use_anthropic_messages_api,
     should_use_responses_api,
 )
-from .platforms import _model_catalog_entry
+from ..platforms import _model_catalog_entry
 
 def bash_description(tool_names: list[str] | None = None) -> str:
     available = set(tool_names or [])

@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 from rich.console import Console
 from rich.table import Table
 
-from .core import (
+from ..core import (
     COPILOT_CLIENT_ID,
     COPILOT_CHAT_PLUGIN_VERSION,
     COPILOT_CHAT_USER_AGENT,

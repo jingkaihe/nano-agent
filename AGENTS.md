@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`nano-agent` is a packaged Python CLI under `src/nano_agent/`. Keep related runtime logic in focused modules (`core`, `platforms`, `tools`, `agent`, `cli`, `ui`) and put regression coverage under `tests/`. Local skill experiments belong under ignored `.agents/`, and generated artifacts such as `__pycache__/`, `.ruff_cache/`, and `.venv/` should stay uncommitted.
+`nano-agent` is a packaged Python CLI under `src/nano_agent/`. Keep related runtime logic in focused modules (`core`, `platforms`, `tools`, `agent`, `cli`, `ui`) and prefer package directories when an area grows large. `src/nano_agent/platforms/` holds platform-specific code by provider, and `src/nano_agent/tools/` holds tool-specific code by tool. Put regression coverage under `tests/`. Local skill experiments belong under ignored `.agents/`, and generated artifacts such as `__pycache__/`, `.ruff_cache/`, and `.venv/` should stay uncommitted.
 
 ## Build, Test, and Development Commands
 Use the packaged project through `uv` from the repo root:
