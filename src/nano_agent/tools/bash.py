@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
-
-from ._internal import bash_description, validate_bash_args, BashRunner
+from ._bash_impl import BashRunner, validate_bash_args
+from .descriptions import bash_description
 from .schemas import bash_schema
 
 __all__ = [

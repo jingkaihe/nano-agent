@@ -2,7 +2,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._common import anthropic, inspect, openai
+from ._common import (
+    ANTHROPIC_API_VERSION,
+    COPILOT_CHAT_PLUGIN_VERSION,
+    COPILOT_CHAT_USER_AGENT,
+    COPILOT_EDITOR_VERSION,
+    COPILOT_GITHUB_API_VERSION,
+    COPILOT_INTEGRATION_ID,
+    COPILOT_VSCODE_USER_AGENT_LIBRARY_VERSION,
+    anthropic,
+    inspect,
+    openai,
+    os,
+    uuid,
+)
+
+
 def _set_copilot_models_cache(
     models: list[dict[str, Any]], *, expires_at: float | None
 ) -> None:
@@ -10,6 +25,7 @@ def _set_copilot_models_cache(
 
     core.COPILOT_MODELS_CACHE = [dict(item) for item in models]
     core.COPILOT_MODELS_CACHE_EXPIRES_AT = expires_at
+
 
 async def _close_async_client(client: Any) -> None:
     close = getattr(client, "close", None)
@@ -71,67 +87,6 @@ def _is_async_context_manager(value: Any) -> bool:
     )
 
 
-def create_openai_copilot_client() -> AsyncOpenAI:
-    base_url = copilot_base_url()
-    creds = load_copilot_credentials()
-    copilot_token, _ = refresh_copilot_token(creds)
-    return AsyncOpenAI(
-        api_key=copilot_token,
-        base_url=base_url,
-        default_headers={
-            "User-Agent": COPILOT_OPENAI_USER_AGENT,
-            "Editor-Version": COPILOT_EDITOR_VERSION,
-        },
-    )
-
-
-def create_anthropic_copilot_client() -> AsyncAnthropic:
-    creds = load_copilot_credentials()
-    copilot_token, _ = refresh_copilot_token(creds)
-    return AsyncAnthropic(
-        auth_token=copilot_token,
-        base_url=copilot_base_url(),
-        default_headers=copilot_anthropic_headers(),
-    )
-
-
-def create_direct_openai_client(
-    api_key: str, base_url: str | None = None
-) -> AsyncOpenAI:
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return AsyncOpenAI(**kwargs)
-
-
-def resolve_anthropic_api_key(api_key: str | None) -> str:
-    resolved_api_key = (
-        api_key or os.getenv("ANTHROPIC_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
-    )
-    if not resolved_api_key:
-        raise ValueError(
-            "Anthropic API key not found. Set ANTHROPIC_API_KEY or pass --api-key."
-        )
-    return resolved_api_key
-
-
-def resolve_anthropic_base_url(base_url: str | None) -> str | None:
-    return (
-        base_url
-        or os.getenv("ANTHROPIC_BASE_URL")
-        or os.getenv("NANO_AGENT_BASE_URL")
-    )
-
-
-def create_direct_anthropic_client(
-    api_key: str, base_url: str | None = None
-) -> AsyncAnthropic:
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return AsyncAnthropic(**kwargs)
-
-
 def copilot_base_url() -> str:
     return (
         "https://api.business.githubcopilot.com"
@@ -177,24 +132,18 @@ def copilot_anthropic_headers() -> dict[str, str]:
     }
 
 
-def resolve_openai_api_key(api_key: str | None) -> str:
-    resolved_api_key = (
-        api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NANO_AGENT_API_KEY")
-    )
-    if not resolved_api_key:
-        raise ValueError(
-            "OpenAI API key not found. Set OPENAI_API_KEY or pass --api-key."
-        )
-    return resolved_api_key
-
-
-def resolve_openai_base_url(base_url: str | None) -> str | None:
-    return base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("NANO_AGENT_BASE_URL")
-
-
 def _anthropic_headers(api_key: str) -> dict[str, str]:
     return {
         "x-api-key": api_key,
         "anthropic-version": ANTHROPIC_API_VERSION,
         "Accept": "application/json",
     }
+
+
+__all__ = [
+    "copilot_anthropic_headers",
+    "copilot_api_headers",
+    "copilot_base_url",
+    "copilot_token_exchange_headers",
+    "is_copilot_auth_error",
+]

@@ -15,6 +15,8 @@ from ._common import (
     save_copilot_credentials,
 )
 from .auth import copilot_token_exchange_headers
+
+
 def generate_device_flow() -> dict[str, Any]:
     response = httpx.post(
         COPILOT_DEVICE_URL,

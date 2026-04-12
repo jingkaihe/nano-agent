@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ._common import GREP_MAX_RESULTS, MAX_READ_LINE_LIMIT
+from ._images_impl import supports_view_image_original_detail
 
 class BashArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from ._internal import execute_apply_patch, parse_apply_patch, apply_patch_description
+from ._apply_patch_impl import execute_apply_patch, parse_apply_patch
+from .descriptions import apply_patch_description
 from .schemas import apply_patch_schema
 
 __all__ = [

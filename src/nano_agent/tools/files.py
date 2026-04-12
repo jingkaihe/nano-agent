@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from ._internal import (
+from ._files_impl import (
     _file_mtime,
     execute_edit_file,
     execute_read_file,
     execute_write_file,
-    read_file_description,
-    write_file_description,
-    edit_file_description,
 )
+from .descriptions import edit_file_description, read_file_description, write_file_description
 from .schemas import edit_file_schema, read_file_schema, write_file_schema
 
 __all__ = [

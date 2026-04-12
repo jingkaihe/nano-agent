@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-from ._internal import (
-    execute_glob,
-    execute_grep,
-    glob_description,
-    grep_description,
-)
+from ._search_impl import execute_glob, execute_grep
+from .descriptions import glob_description, grep_description
 from .schemas import glob_schema, grep_schema
 
 __all__ = [
